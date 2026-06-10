@@ -31,61 +31,26 @@ from terratorch.models.backbones.prithvi_mae import PrithviViT
 from terratorch.tasks import PixelwiseRegressionTask
 
 from utils import *
-from models import *
-from data_loader import *
+from model.models import *
+from data_loader.data_loader import *
 
-def run(
-    model_name,
-    config_fname,
-    wt_file,
-    use_TL_encoding,
-    test_year,
-    output_dir,
-    manually_parse_weights,
-    T_HLS=1,
-    T_MERRA=1,
-    seed=0,
-):
-    set_seed(seed)
-    output_dir = Path(output_dir)
 
-    ### Reading model configs from YAML file.
-    with open(config_fname, "r") as file:
-        config = yaml.safe_load(file)
-    config["T_HLS"] = T_HLS
-    config["T_MERRA"] = T_MERRA
-    config["seed"] = seed
-    config["test_year"] = test_year
-
-    # Snapshot the resolved config before any in-place numpy conversions below,
-    # so the dumped file stays plain YAML (no numpy/Path tags).
-    with open(output_dir / "config.yaml", "w") as f:
-        yaml.safe_dump(config, f, sort_keys=False)
-
-    n_channel = config["model"]["n_channel"]
-    embed_dim = config["model"]["embed_dim"]
-    patch_size = config["model"]["patch_size"]
-    num_heads = config["model"]["num_heads"]
-    mlp_ratio = config["model"]["mlp_ratio"]
-    depth = config["model"]["depth"]
-    head_dropout = config["model"]["head_dropout"]
-
-    n_iteration = config["n_iteration"]
-    train_batch_size = config["training"]["train_batch_size"]
-    test_batch_size = config["testing"]["test_batch_size"]
-    learning_rate = float(config["training"]["optimizer"]["params"]["lr"])
-    chips = config["data"]["chips"]
-    chips_test = config["data"]["test_chips"]
+def build_data(cfg):
+    """Read inputs, build temporal windows, and wrap them in datamodules."""
+    cfg_data = cfg["data"]
+    T_HLS = cfg["T_HLS"]
+    T_MERRA = cfg["T_MERRA"]
+    test_year = cfg["test_year"]
+    train_batch_size = cfg["training"]["train_batch_size"]
+    test_batch_size = cfg["testing"]["test_batch_size"]
 
     print("TEST YEAR", test_year)
-    means = config["data"][f"means_for{test_year}test"]
-    stds = config["data"][f"stds_for{test_year}test"]
-    merra_means = config["data"][f"merra_means_for{test_year}test"]
-    merra_stds = config["data"][f"merra_stds_for{test_year}test"]
-    gpp_means = config["data"][f"gpp_means_for{test_year}test"]
-    gpp_stds = config["data"][f"gpp_stds_for{test_year}test"]
-
-    ### Reading information about the datasets, as paths to the files and variables used to normalize them.
+    means = np.array(cfg_data[f"means_for{test_year}test"])
+    stds = np.array(cfg_data[f"stds_for{test_year}test"])
+    merra_means = np.array(cfg_data[f"merra_means_for{test_year}test"])
+    merra_stds = np.array(cfg_data[f"merra_stds_for{test_year}test"])
+    gpp_means = np.array(cfg_data[f"gpp_means_for{test_year}test"])
+    gpp_stds = np.array(cfg_data[f"gpp_stds_for{test_year}test"])
 
     # read merra, gpp inputs
     df = pd.read_csv("/home/yjean234/Azad/Prithvi-EO-2.0/examples/carbon_flux/data_train_hls_37sites_v0_1.csv")
@@ -95,23 +60,14 @@ def run(
     train_df = df[df["year"] != test_year]
 
     train_chips, merra_train, train_target, train_dates = build_windows(
-        train_df, chips, T_HLS, T_MERRA
+        train_df, cfg_data["chips"], T_HLS, T_MERRA
     )
     test_chips, merra_test, test_target, test_dates = build_windows(
-        test_df, chips_test, T_HLS, T_MERRA
+        test_df, cfg_data["test_chips"], T_HLS, T_MERRA
     )
     print(
         f"T_HLS={T_HLS}  T_MERRA={T_MERRA}  train windows={len(train_chips)}  test windows={len(test_chips)}"
     )
-
-    means = np.array(means)
-    stds = np.array(stds)
-    merra_means = np.array(merra_means)
-    merra_stds = np.array(merra_stds)
-    gpp_means = np.array(gpp_means)
-    gpp_stds = np.array(gpp_stds)
-
-    ### Instantiating the datamodules used to create the training and testing batches.
 
     # Each sample's first arg is a list of T_HLS chip paths (oldest -> newest).
     flux_dataset_train = flux_dataset(
@@ -140,33 +96,47 @@ def run(
     )
 
     datamodule = flux_dataloader(
-        flux_dataset_train, flux_dataset_test, train_batch_size, test_batch_size, config
+        flux_dataset_train, flux_dataset_test, train_batch_size, test_batch_size, cfg
     )
+    # datamodule_ serves the train set as its "test" loader, so we can score the
+    # train split through the same predict path used for the test split.
     datamodule_ = flux_dataloader(
         flux_dataset_train,
         flux_dataset_train,
         train_batch_size,
         test_batch_size,
-        config,
+        cfg,
+    )
+    return (
+        datamodule,
+        datamodule_,
+        flux_dataset_train,
+        flux_dataset_test,
+        gpp_means,
+        gpp_stds,
     )
 
-    if use_TL_encoding:
-        coords_encoding = ["time", "location"]
-    else:
-        coords_encoding = []
+
+def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
+    """Assemble the frozen Prithvi encoder + regression head into a Lightning task."""
+    cfg_model = cfg["model"]
+    T_HLS = cfg["T_HLS"]
+    T_MERRA = cfg["T_MERRA"]
+
+    coords_encoding = ["time", "location"] if use_TL_encoding else []
 
     prithvi_instance = PrithviViT(
-        patch_size=patch_size,
+        patch_size=cfg_model["patch_size"],
         num_frames=T_HLS,
-        in_chans=n_channel,
-        embed_dim=embed_dim,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        head_dropout=head_dropout,
+        in_chans=cfg_model["n_channel"],
+        embed_dim=cfg_model["embed_dim"],
+        num_heads=cfg_model["num_heads"],
+        mlp_ratio=cfg_model["mlp_ratio"],
+        head_dropout=cfg_model["head_dropout"],
         backbone_input_size=[T_HLS, 50, 50],
         encoder_only=False,
         padding=True,
-        depth=depth,
+        depth=cfg_model["depth"],
         coords_encoding=coords_encoding,
     )
     prithvi_model = prithvi_terratorch(
@@ -183,67 +153,54 @@ def run(
     task = PixelwiseRegressionTask(
         None, None, model=model_comb, loss="mse", optimizer="AdamW"
     )
+    return task
 
-    accelerator = "cuda"
+
+def build_trainer(cfg, task, output_dir):
+    """Construct the Lightning Trainer with the run's callbacks and logger."""
     checkpoint_callback = ModelCheckpoint(
         monitor=task.monitor, save_top_k=1, save_last=True
     )
-    num_epochs = n_iteration
-    default_root_dir = output_dir
-    logger = TensorBoardLogger(save_dir=str(default_root_dir), name="carbon_flux")
+    # Logger created for its side effect of fixing the log dir layout, as in the
+    # original script (Trainer itself logs to default_root_dir).
+    TensorBoardLogger(save_dir=str(output_dir), name="carbon_flux")
 
     trainer = Trainer(
-        accelerator=accelerator,
+        accelerator="cuda",
         callbacks=[
             RichProgressBar(),
             checkpoint_callback,
             LearningRateMonitor(logging_interval="epoch"),
         ],
-        max_epochs=num_epochs,
-        default_root_dir=str(default_root_dir),
+        max_epochs=cfg["n_iteration"],
+        default_root_dir=str(output_dir),
         log_every_n_steps=1,
         check_val_every_n_epoch=200,
     )
+    return trainer
 
-    ### Zeroshot evaluation (no training)
-    zs = predict_and_score(
-        trainer, task, datamodule, flux_dataset_test, gpp_means, gpp_stds
+
+def evaluate_split(
+    trainer, task, datamodule, eval_dataset, gpp_means, gpp_stds, label,
+    model_name, test_year, output_dir,
+):
+    """Predict + score one split and save its scatter plot. Returns the score dict."""
+    scores = predict_and_score(
+        trainer, task, datamodule, eval_dataset, gpp_means, gpp_stds
     )
     save_scatter(
-        zs["targ_unnorm"],
-        zs["pred_unnorm"],
-        zs["r2_unnorm"],
-        f"{model_name} {test_year} zeroshot test",
-        output_dir / "zeroshot_scatter.png",
+        scores["targ_unnorm"],
+        scores["pred_unnorm"],
+        scores["r2_unnorm"],
+        f"{model_name} {test_year} {label}",
+        output_dir / f"{label}_scatter.png",
     )
+    return scores
 
-    ### Training
-    trainer.fit(model=task, datamodule=datamodule)
 
-    ### Post-training eval on test set
-    test = predict_and_score(
-        trainer, task, datamodule, flux_dataset_test, gpp_means, gpp_stds
-    )
-    save_scatter(
-        test["targ_unnorm"],
-        test["pred_unnorm"],
-        test["r2_unnorm"],
-        f"{model_name} {test_year} test",
-        output_dir / "test_scatter.png",
-    )
-
-    ### Post-training eval on train set
-    train = predict_and_score(
-        trainer, task, datamodule_, flux_dataset_train, gpp_means, gpp_stds
-    )
-    save_scatter(
-        train["targ_unnorm"],
-        train["pred_unnorm"],
-        train["r2_unnorm"],
-        f"{model_name} {test_year} train",
-        output_dir / "train_scatter.png",
-    )
-
+def save_metrics(zs, test, train, cfg, output_dir):
+    """Collect per-split scores into one metrics dict and write it as JSON."""
+    learning_rate = float(cfg["training"]["optimizer"]["params"]["lr"])
     metrics = {
         "zeroshot_r2_norm": zs["r2_norm"],
         "zeroshot_r2_unnorm": zs["r2_unnorm"],
@@ -255,12 +212,62 @@ def run(
         "train_r2_unnorm": train["r2_unnorm"],
         "train_mse_unnorm": train["mse_unnorm"],
         "train_mae_unnorm": train["mae_unnorm"],
-        "num_epochs": num_epochs,
+        "num_epochs": cfg["n_iteration"],
         "learning_rate": learning_rate,
     }
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
+    return metrics
 
+def read_and_save_config(cfg_fname, T_HLS, T_MERRA, test_year, output_dir, seed=0):
+    ### Read model configs from YAML and stamp in this run's resolved values.
+    with open(cfg_fname, "r") as file:
+        cfg = yaml.safe_load(file)
+    cfg["T_HLS"] = T_HLS
+    cfg["T_MERRA"] = T_MERRA
+    cfg["seed"] = seed
+    cfg["test_year"] = test_year
+
+    # Snapshot the resolved config before any in-place numpy conversions below,
+    # so the dumped file stays plain YAML (no numpy/Path tags).
+    with open(output_dir / "config.yaml", "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    
+    return cfg
+
+
+def run(
+    model_name,
+    wt_file,
+    use_TL_encoding,
+    output_dir,
+    manually_parse_weights,
+    cfg,
+):
+    set_seed(cfg["seed"])
+
+    (datamodule, datamodule_train, flux_dataset_train, flux_dataset_test,
+     gpp_means, gpp_stds) = build_data(cfg)
+
+    task = build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights)
+    trainer = build_trainer(cfg, task, output_dir)
+
+    # zeroshot eval -> fit -> post-training eval on the test and train splits.
+    zs = evaluate_split(
+        trainer, task, datamodule, flux_dataset_test, gpp_means, gpp_stds,
+        "zeroshot", model_name, cfg["test_year"], output_dir,
+    )
+    trainer.fit(model=task, datamodule=datamodule)
+    test = evaluate_split(
+        trainer, task, datamodule, flux_dataset_test, gpp_means, gpp_stds,
+        "test", model_name, cfg["test_year"], output_dir,
+    )
+    train = evaluate_split(
+        trainer, task, datamodule_train, flux_dataset_train, gpp_means, gpp_stds,
+        "train", model_name, cfg["test_year"], output_dir,
+    )
+
+    metrics = save_metrics(zs, test, train, cfg, output_dir)
     print(f'  test R2={test["r2_unnorm"]:.4f}  train R2={train["r2_unnorm"]:.4f}')
     return metrics
 
@@ -366,17 +373,17 @@ def main():
             )
             run_dir.mkdir(parents=True, exist_ok=True)
 
+            cfg = read_and_save_config(
+                config_fname, T_HLS, T_MERRA, test_year, run_dir, seed
+            )
+
             metrics = run(
                 model_name=model_name,
-                config_fname=config_fname,
                 wt_file=wt_file,
                 use_TL_encoding=use_TL_encoding,
-                test_year=test_year,
                 output_dir=run_dir,
                 manually_parse_weights=manually_parse_weights,
-                T_HLS=T_HLS,
-                T_MERRA=T_MERRA,
-                seed=seed,
+                cfg=cfg,
             )
             summary_rows.append({"model": model_name, "year": test_year, **metrics})
             pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
