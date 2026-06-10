@@ -1,0 +1,1 @@
+python /home/yjean234/Azad/soil_moisture/GPP.py
