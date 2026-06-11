@@ -33,92 +33,163 @@ from terratorch.tasks import PixelwiseRegressionTask
 from utils import *
 from model.models import *
 from data_loader.data_loader import *
+from preprocess.compute_data_stats import hls_stats, col_stats
 
 
-def build_data(cfg):
-    """Read inputs, build temporal windows, and wrap them in datamodules."""
+def load_merra_frame(stations, merra_root):
+    """Load + merge MERRA for a set of stations into one MultiIndexed DataFrame.
+
+    For each (network, station) in `stations`, reads the LND and SLV CSVs, parses
+    `time`, and merges them on `time` (LND/SLV share identical hourly timestamps)
+    so each row carries all MERRA_COLS. The concatenated frame is indexed on
+    (network, station) for fast per-station lookup. MERRA filenames sanitize
+    '#' -> '_' (HLS folders keep '#').
+    """
+    frames = []
+    for network, station in stations:
+        st = station.replace("#", "_")
+        def _read(product):
+            hits = sorted(glob.glob(
+                os.path.join(merra_root, f"{network}_{st}_{product}_*.csv")))
+            if not hits:
+                raise FileNotFoundError(
+                    f"No MERRA {product} file for {network}_{st} in {merra_root}")
+            d = pd.read_csv(hits[0])
+            d["time"] = pd.to_datetime(d["time"])
+            return d
+        lnd = _read("M2T1NXLND")[["time"] + MERRA_LND_COLS]
+        slv = _read("M2T1NXSLV")[["time"] + MERRA_SLV_COLS]
+        merged = lnd.merge(slv, on="time", how="inner")
+        merged["network"] = network
+        merged["station"] = station
+        frames.append(merged)
+    out = pd.concat(frames, ignore_index=True)
+    return out.set_index(["network", "station"]).sort_index()
+
+
+def dummy_sm_stats():
+    """Hardcoded normalization stats matching compute_sm_stats' return shapes."""
+    n_hls = 6
+    n_merra = len(MERRA_COLS)  # 10
+    return (
+        np.zeros(n_hls, dtype=np.float32),       # means
+        np.ones(n_hls, dtype=np.float32),        # stds
+        np.zeros(n_merra, dtype=np.float32),     # merra_means
+        np.ones(n_merra, dtype=np.float32),      # merra_stds
+        np.zeros(1, dtype=np.float32),           # sm_mean
+        np.ones(1, dtype=np.float32),            # sm_std
+    )
+
+
+def compute_sm_stats(train_df, chips_root, merra_train, output_dir):
+    """Compute train-split-only normalization stats for the SM task and save them.
+
+    HLS stats are per-band over one resolved chip per train row. We seed the
+    global numpy RNG first so the chip resolution here is reproducible. MERRA
+    stats are over the per-row overpass-time vectors; SM stats over the
+    soil_moisture column. The same stats normalize train AND test, so the held-out
+    split never leaks into normalization. Stats are written to the run's output
+    dir (they are bound to this split/seed), and also returned in-memory.
+    """
+    # HLS + MERRA: resolve one chip per train row (its overpass time drives the
+    # MERRA lookup), accumulate chip paths and MERRA vectors together.
+    chip_paths = []
+    merra_rows = []
+    for _, row in train_df.iterrows():
+        network, station = str(row["network"]), str(row["station"])
+        day = datetime.fromisoformat(str(row["date"])).date()
+        chip = resolve_chip(network, station, day, chips_root)
+        chip_paths.append(chip)
+        merra_rows.append(
+            merra_vector(merra_train, network, station, overpass_datetime(chip))
+        )
+    # chips_dir="" so hls_stats uses the absolute paths as-is.
+    means, stds = hls_stats(chip_paths, chips_dir="")
+
+    merra_rows = np.stack(merra_rows)
+    merra_means = merra_rows.mean(axis=0)
+    merra_stds = merra_rows.std(axis=0, ddof=1)
+
+    # SM target: mean/std of the soil_moisture column (ddof=1).
+    sm_mean, sm_std = col_stats(train_df, ["soil_moisture"])
+
+    stats = {
+        "provenance": {
+            "n_train_rows": int(len(train_df)),
+            "n_train_stations": int(train_df.groupby(["network", "station"]).ngroups),
+            "merra_cols": MERRA_COLS,
+            "computed_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        "hls": {"means": means.tolist(), "stds": stds.tolist()},
+        "merra": {"means": merra_means.tolist(), "stds": merra_stds.tolist()},
+        "sm": {"mean": sm_mean.tolist(), "std": sm_std.tolist()},
+    }
+    with open(Path(output_dir) / "stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+
+    return (means, stds, merra_means, merra_stds, sm_mean, sm_std)
+
+
+def build_data(cfg, output_dir):
+    """Build the SM train/test datasets from the master CSV and wrap in datamodules."""
+    print("building data...")
     cfg_data = cfg["data"]
-    T_HLS = cfg["T_HLS"]
-    T_MERRA = cfg["T_MERRA"]
-    test_year = cfg["test_year"]
     train_batch_size = cfg["training"]["train_batch_size"]
     test_batch_size = cfg["testing"]["test_batch_size"]
+    chips_root = cfg_data["chips_root"]
+    merra_root = cfg_data["merra_root"]
 
-    print("TEST YEAR", test_year)
-    means = np.array(cfg_data[f"means_for{test_year}test"])
-    stds = np.array(cfg_data[f"stds_for{test_year}test"])
-    merra_means = np.array(cfg_data[f"merra_means_for{test_year}test"])
-    merra_stds = np.array(cfg_data[f"merra_stds_for{test_year}test"])
-    gpp_means = np.array(cfg_data[f"gpp_means_for{test_year}test"])
-    gpp_stds = np.array(cfg_data[f"gpp_stds_for{test_year}test"])
+    df = pd.read_csv(cfg_data["master_csv"])
+    df = df[df["has_HLS"] == 1].reset_index(drop=True)
 
-    # read merra, gpp inputs
-    df = pd.read_csv("/home/yjean234/Azad/Prithvi-EO-2.0/examples/carbon_flux/data_train_hls_37sites_v0_1.csv")
+    # Spatial (by-station) split -- leakage-safe.
+    train_df, test_df = spatial_split(df, test_fraction=cfg_data.get("test_fraction", 0.2))
+    print(f"SM split: train rows={len(train_df)}  test rows={len(test_df)}")
 
-    # get train_test splits, then build temporal windows per (site, year).
-    test_df = df[df["year"] == test_year]
-    train_df = df[df["year"] != test_year]
+    # Load MERRA once per split (read + LND/SLV merge), indexed by station.
+    train_stations = list(train_df[["network", "station"]].drop_duplicates().itertuples(index=False, name=None))
+    test_stations = list(test_df[["network", "station"]].drop_duplicates().itertuples(index=False, name=None))
+    merra_train = load_merra_frame(train_stations, merra_root)
+    merra_test = load_merra_frame(test_stations, merra_root)
 
-    train_chips, merra_train, train_target, train_dates = build_windows(
-        train_df, cfg_data["chips"], T_HLS, T_MERRA
+    if cfg.get("debug", False):
+        print("debug=True -- skipping compute_sm_stats, using dummy stats")
+        means, stds, merra_means, merra_stds, sm_mean, sm_std = dummy_sm_stats()
+    else:
+        means, stds, merra_means, merra_stds, sm_mean, sm_std = compute_sm_stats(
+            train_df, chips_root, merra_train, output_dir
+        )
+
+    sm_dataset_train = sm_dataset(
+        train_df, chips_root, merra_train,
+        means, stds, merra_means, merra_stds, sm_mean, sm_std,
     )
-    test_chips, merra_test, test_target, test_dates = build_windows(
-        test_df, cfg_data["test_chips"], T_HLS, T_MERRA
-    )
-    print(
-        f"T_HLS={T_HLS}  T_MERRA={T_MERRA}  train windows={len(train_chips)}  test windows={len(test_chips)}"
-    )
-
-    # Each sample's first arg is a list of T_HLS chip paths (oldest -> newest).
-    flux_dataset_train = flux_dataset(
-        train_chips,
-        means,
-        stds,
-        merra_train,
-        merra_means,
-        merra_stds,
-        gpp_means,
-        gpp_stds,
-        train_target,
-        dates=train_dates,
-    )
-    flux_dataset_test = flux_dataset(
-        test_chips,
-        means,
-        stds,
-        merra_test,
-        merra_means,
-        merra_stds,
-        gpp_means,
-        gpp_stds,
-        test_target,
-        dates=test_dates,
+    sm_dataset_test = sm_dataset(
+        test_df, chips_root, merra_test,
+        means, stds, merra_means, merra_stds, sm_mean, sm_std,
     )
 
-    datamodule = flux_dataloader(
-        flux_dataset_train, flux_dataset_test, train_batch_size, test_batch_size, cfg
+    datamodule = sm_dataloader(
+        sm_dataset_train, sm_dataset_test, train_batch_size, test_batch_size, cfg
     )
     # datamodule_ serves the train set as its "test" loader, so we can score the
     # train split through the same predict path used for the test split.
-    datamodule_ = flux_dataloader(
-        flux_dataset_train,
-        flux_dataset_train,
-        train_batch_size,
-        test_batch_size,
-        cfg,
+    datamodule_ = sm_dataloader(
+        sm_dataset_train, sm_dataset_train, train_batch_size, test_batch_size, cfg
     )
     return (
         datamodule,
         datamodule_,
-        flux_dataset_train,
-        flux_dataset_test,
-        gpp_means,
-        gpp_stds,
+        sm_dataset_train,
+        sm_dataset_test,
+        sm_mean,
+        sm_std,
     )
 
 
 def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
     """Assemble the frozen Prithvi encoder + regression head into a Lightning task."""
+    print("building a model...")
     cfg_model = cfg["model"]
     T_HLS = cfg["T_HLS"]
     T_MERRA = cfg["T_MERRA"]
@@ -149,7 +220,7 @@ def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
 
     # Encoder emits (patches_per_frame * T_HLS + 1) tokens; padded 50x50 / patch 16 -> 3x3 = 9 patches/frame.
     n_tokens = 9 * T_HLS + 1
-    model_comb = RegressionModel_flux(prithvi_model, n_tokens=n_tokens, T_MERRA=T_MERRA)
+    model_comb = RegressionModelSM(prithvi_model, n_tokens=n_tokens, T_MERRA=T_MERRA)
     task = PixelwiseRegressionTask(
         None, None, model=model_comb, loss="mse", optimizer="AdamW"
     )
@@ -158,6 +229,7 @@ def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
 
 def build_trainer(cfg, task, output_dir):
     """Construct the Lightning Trainer with the run's callbacks and logger."""
+    print("building a trainer...")
     checkpoint_callback = ModelCheckpoint(
         monitor=task.monitor, save_top_k=1, save_last=True
     )
@@ -181,18 +253,19 @@ def build_trainer(cfg, task, output_dir):
 
 
 def evaluate_split(
-    trainer, task, datamodule, eval_dataset, gpp_means, gpp_stds, label,
-    model_name, test_year, output_dir,
+    trainer, task, datamodule, eval_dataset, sm_mean, sm_std, label,
+    model_name, output_dir,
 ):
     """Predict + score one split and save its scatter plot. Returns the score dict."""
+    print("evaluating a split...")
     scores = predict_and_score(
-        trainer, task, datamodule, eval_dataset, gpp_means, gpp_stds
+        trainer, task, datamodule, eval_dataset, sm_mean, sm_std
     )
     save_scatter(
         scores["targ_unnorm"],
         scores["pred_unnorm"],
         scores["r2_unnorm"],
-        f"{model_name} {test_year} {label}",
+        f"{model_name} {label}",
         output_dir / f"{label}_scatter.png",
     )
     return scores
@@ -219,14 +292,13 @@ def save_metrics(zs, test, train, cfg, output_dir):
         json.dump(metrics, f, indent=2)
     return metrics
 
-def read_and_save_config(cfg_fname, T_HLS, T_MERRA, test_year, output_dir, seed=0):
+def read_and_save_config(cfg_fname, T_HLS, T_MERRA, output_dir, seed=0):
     ### Read model configs from YAML and stamp in this run's resolved values.
     with open(cfg_fname, "r") as file:
         cfg = yaml.safe_load(file)
     cfg["T_HLS"] = T_HLS
     cfg["T_MERRA"] = T_MERRA
     cfg["seed"] = seed
-    cfg["test_year"] = test_year
 
     # Snapshot the resolved config before any in-place numpy conversions below,
     # so the dumped file stays plain YAML (no numpy/Path tags).
@@ -246,25 +318,25 @@ def run(
 ):
     set_seed(cfg["seed"])
 
-    (datamodule, datamodule_train, flux_dataset_train, flux_dataset_test,
-     gpp_means, gpp_stds) = build_data(cfg)
+    (datamodule, datamodule_train, sm_dataset_train, sm_dataset_test,
+     sm_mean, sm_std) = build_data(cfg, output_dir)
 
     task = build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights)
     trainer = build_trainer(cfg, task, output_dir)
 
     # zeroshot eval -> fit -> post-training eval on the test and train splits.
     zs = evaluate_split(
-        trainer, task, datamodule, flux_dataset_test, gpp_means, gpp_stds,
-        "zeroshot", model_name, cfg["test_year"], output_dir,
+        trainer, task, datamodule, sm_dataset_test, sm_mean, sm_std,
+        "zeroshot", model_name, output_dir,
     )
     trainer.fit(model=task, datamodule=datamodule)
     test = evaluate_split(
-        trainer, task, datamodule, flux_dataset_test, gpp_means, gpp_stds,
-        "test", model_name, cfg["test_year"], output_dir,
+        trainer, task, datamodule, sm_dataset_test, sm_mean, sm_std,
+        "test", model_name, output_dir,
     )
     train = evaluate_split(
-        trainer, task, datamodule_train, flux_dataset_train, gpp_means, gpp_stds,
-        "train", model_name, cfg["test_year"], output_dir,
+        trainer, task, datamodule_train, sm_dataset_train, sm_mean, sm_std,
+        "train", model_name, output_dir,
     )
 
     metrics = save_metrics(zs, test, train, cfg, output_dir)
@@ -292,6 +364,7 @@ def main():
     parser.add_argument("--t-merra", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tl-encoding", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     warnings.filterwarnings("ignore")
@@ -315,7 +388,6 @@ def main():
             args.seed,
         )
     ]
-    years = [2020]
 
     # --- Toggle: original T_HLS x T_MERRA sweep (9 runs, single seed) ---
     # model_configs = [
@@ -336,7 +408,6 @@ def main():
     #     ('Prithvi-EO-2.0-600M',    'fluxconfig_trainer_large.yaml', 'Prithvi_EO_V2_600M_TL.pt', False),
     #     ('Prithvi-EO-2.0-600M-TL', 'fluxconfig_trainer_large.yaml', 'Prithvi_EO_V2_600M_TL.pt', True),
     # ]
-    # years = [2018, 2019, 2020, 2021]
 
     output_root = Path("outputs")
     manually_parse_weights = True
@@ -359,36 +430,33 @@ def main():
         T_MERRA,
         seed,
     ) in model_configs:
-        for test_year in years:
-            print(
-                f"\n=== {model_name} | test year {test_year} | T_HLS {T_HLS} | seed {seed} ==="
-            )
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = (
-                output_root
-                / model_name
-                / f"year_{test_year}"
-                / f"thls_{T_HLS}_tmerra_{T_MERRA}_seed_{seed}"
-                / ts
-            )
-            run_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"\n=== {model_name} | T_HLS {T_HLS} | T_MERRA {T_MERRA} | seed {seed} ==="
+        )
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = (
+            output_root
+            / model_name
+            / f"thls_{T_HLS}_tmerra_{T_MERRA}_seed_{seed}"
+            / ts
+        )
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-            cfg = read_and_save_config(
-                config_fname, T_HLS, T_MERRA, test_year, run_dir, seed
-            )
+        cfg = read_and_save_config(config_fname, T_HLS, T_MERRA, run_dir, seed)
+        cfg["debug"] = args.debug
 
-            metrics = run(
-                model_name=model_name,
-                wt_file=wt_file,
-                use_TL_encoding=use_TL_encoding,
-                output_dir=run_dir,
-                manually_parse_weights=manually_parse_weights,
-                cfg=cfg,
-            )
-            summary_rows.append({"model": model_name, "year": test_year, **metrics})
-            pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+        metrics = run(
+            model_name=model_name,
+            wt_file=wt_file,
+            use_TL_encoding=use_TL_encoding,
+            output_dir=run_dir,
+            manually_parse_weights=manually_parse_weights,
+            cfg=cfg,
+        )
+        summary_rows.append({"model": model_name, **metrics})
+        pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
 
-            print(f"Run output dir at {run_dir.absolute()}")
+        print(f"Run output dir at {run_dir.absolute()}")
 
     print(f"\nWrote summary to {summary_path}")
 

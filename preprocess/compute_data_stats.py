@@ -6,21 +6,23 @@ import numpy as np
 import pandas as pd
 import rasterio
 
-NO_DATA = -0.9999
 NO_DATA_FLOAT = 0.0001
 MERRA_FOR_GPP_COLS = ["T2MIN","T2MAX","T2MEAN","TSMDEWMEAN","GWETROOT",
               "LHLAND","SHLAND","SWLAND","PARDFLAND","PRECTOTLAND"]
 
 def hls_stats(chip_paths, chips_dir):
-    """Compute the mean and std of all chip_paths"""
-    n = np.zeros(6)  # num pixels per band
-    s = np.zeros(6)  # sum values per band
-    ss = np.zeros(6)
-    
+    """Compute per-band mean and std over all chips.
+
+    Reads bands 0-5, remaps the -0.9999 NO_DATA sentinel, and compute the statistics where std uses ddof=0 (population); E[x^2]-mean^2 form lets us accumulate sums in one pass.
+    """
+    n = np.zeros(6)   # num valid pixels per band
+    s = np.zeros(6)   # sum of values per band
+    ss = np.zeros(6)  # sum of squares per band
+
     for name in chip_paths:
         with rasterio.open(os.path.join(chips_dir, str(name))) as src:
             img = src.read()
-        img = np.where(img == NO_DATA, NO_DATA_FLOAT, img)
+        img = np.where(np.isnan(img), NO_DATA_FLOAT, img)
         img = img[:, -50:, -50:]
         n += img.shape[1] * img.shape[2]
         s += img.sum(axis=(1,2))

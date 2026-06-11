@@ -42,8 +42,8 @@ def save_scatter(targ, pred, r2, title, path):
     ax.scatter(targ, pred, alpha=0.6)
     lo, hi = float(min(targ)), float(max(targ))
     ax.plot([lo, hi], [lo, hi], color="red", lw=2, label="Perfect fit")
-    ax.set_xlabel("True GPP", fontsize=14)
-    ax.set_ylabel("Predicted GPP", fontsize=14)
+    ax.set_xlabel("True SM", fontsize=14)
+    ax.set_ylabel("Predicted SM", fontsize=14)
     ax.grid(True)
     ax.set_title(f"{title} — R2: {r2:.4f} - size: {len(targ)}")
     fig.savefig(path, dpi=120, bbox_inches="tight")
@@ -51,20 +51,20 @@ def save_scatter(targ, pred, r2, title, path):
 
 
 def predict_and_score(
-    trainer, task, datamodule, flux_dataset_eval, gpp_means, gpp_stds
+    trainer, task, datamodule, sm_dataset_eval, sm_mean, sm_std
 ):
     results = trainer.predict(
         model=task, datamodule=datamodule, return_predictions=True
     )
     pred = np.concatenate([i[0] for i in results], axis=0)
-    targ = np.concatenate([j["mask"] for j in flux_dataset_eval], axis=0)[:, None]
+    targ = np.concatenate([j["mask"] for j in sm_dataset_eval], axis=0)[:, None]
 
     r2_norm = r2_score(targ, pred)
 
-    mean_gpp = gpp_means.reshape(-1, 1, 1)
-    stds_gpp = gpp_stds.reshape(-1, 1, 1)
-    pred_unnorm = (pred * stds_gpp + mean_gpp).flatten()[:, None]
-    targ_unnorm = (targ * stds_gpp + mean_gpp).flatten()[:, None]
+    mean_sm = sm_mean.reshape(-1, 1, 1)
+    stds_sm = sm_std.reshape(-1, 1, 1)
+    pred_unnorm = (pred * stds_sm + mean_sm).flatten()[:, None]
+    targ_unnorm = (targ * stds_sm + mean_sm).flatten()[:, None]
     r2_unnorm = r2_score(targ_unnorm, pred_unnorm)
     mse_unnorm = float(np.mean((targ_unnorm - pred_unnorm) ** 2))
     mae_unnorm = float(np.mean(np.abs(targ_unnorm - pred_unnorm)))

@@ -11,6 +11,45 @@ from einops import rearrange
 from timm.layers import to_2tuple
 from timm.models.vision_transformer import Block
 
+
+class PatchEmbed(nn.Module):
+    """3D version of timm.models.vision_transformer.PatchEmbed"""
+    def __init__(
+            self,
+            input_size: Tuple[int, int, int] = (1, 224, 224),
+            patch_size: Tuple[int, int, int] = (1, 16, 16),
+            in_chans: int = 3,
+            embed_dim: int = 768,
+            norm_layer: nn.Module | None = None,
+            flatten: bool = True,
+            bias: bool = True,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.patch_size = patch_size
+        self.grid_size = [s // p for s, p in zip(self.input_size, self.patch_size)]
+        assert self.grid_size >= [1,1,1], "Patch size is bigger than input size."
+        self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
+        self.flatten = flatten
+
+        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+        self.log_warning = True
+
+    def forward(self, x):
+        B, C, T, H, W = x.shape
+
+        if (self.log_warning and
+                (T / self.patch_size[0] % 1 or H / self.patch_size[1] % 1 or W / self.patch_size[2] % 1)):
+            print(f"Input {x.shape[-3:]} is not divisible by patch size {self.patch_size}."
+                           f"The border will be ignored, add backbone_padding for pixel-wise tasks.")
+            self.log_warning = False
+
+        x = self.proj(x)
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)  # B,C,T,H,W -> B,C,L -> B,L,C
+        x = self.norm(x)
+        return x
 class PrithviViT(nn.Module):
     """ Prithvi ViT Encoder"""
     def __init__(self,
@@ -354,10 +393,11 @@ class Pt1dConvBranch(nn.Module):
         x = self.fc(x)                 # [B, 8]         -> [B, 64]
         return x
 
-# Define the regression model --simple regression to concatenate prithvi merra and regress to gpp lfux
-class RegressionModel_flux(LightningModule):
+# Simple regression head: concatenate the Prithvi (HLS) and MERRA branches and
+# regress to a single scalar -- the soil-moisture (SM) target.
+class RegressionModelSM(LightningModule):
     def __init__(self, prithvi_model, n_tokens=10, T_MERRA=1):
-        super(RegressionModel_flux, self).__init__()
+        super(RegressionModelSM, self).__init__()
         self.prithvi_model = prithvi_model
         prithvi_emb_dim = self.prithvi_model.prithvi_model.embed_dim
         self.decoder = SimpleDecoder_comb_v2(
@@ -367,6 +407,13 @@ class RegressionModel_flux(LightningModule):
         self.fc_final = nn.Linear(128, 1)  # Regression output
 
     def forward(self, im2d, pt1d, temporal_coords=None, location_coords=None, **kwargs):
+        # The MERRA conv branch expects [B, n_vars, T]. The single-frame SM loader
+        # emits pt1d as [B, n_vars] (no time axis), so add a singleton T=1 axis.
+        if pt1d.dim() == 2:
+            pt1d = pt1d.unsqueeze(-1)  # [B, n_vars] -> [B, n_vars, 1]
+        if im2d.dim() == 4:
+            im2d = im2d.unsqueeze(2)  # [B, n_vars] -> [B, n_vars, 1]
+
         # Pass HLS im2d through the pretrained prithvi MAE encoder (with frozen weights).
         # temporal_coords / location_coords are no-ops unless the backbone was built with coords_encoding.
         pri_enc = self.prithvi_model(im2d, temporal_coords, location_coords, 0)
