@@ -1,8 +1,11 @@
 import random
+from typing import Any
+
 from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from lightning.pytorch import LightningDataModule, LightningModule, Trainer
 
 from sklearn.metrics import r2_score
 from torcheval.metrics import R2Score
@@ -51,8 +54,13 @@ def save_scatter(targ, pred, r2, title, path):
 
 
 def predict_and_score(
-    trainer, task, datamodule, sm_dataset_eval, sm_mean, sm_std
-):
+    trainer: Trainer,
+    task: LightningModule,
+    datamodule: LightningDataModule,
+    sm_dataset_eval: Any,
+    sm_mean: np.ndarray,
+    sm_std: np.ndarray,
+) -> dict[str, Any]:
     results = trainer.predict(
         model=task, datamodule=datamodule, return_predictions=True
     )

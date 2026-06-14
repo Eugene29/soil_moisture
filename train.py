@@ -233,12 +233,6 @@ def build_trainer(cfg, task, output_dir, model_name, ts):
     checkpoint_callback = ModelCheckpoint(
         monitor=task.monitor, save_top_k=1, save_last=True
     )
-    # Logger created for its side effect of fixing the log dir layout, as in the
-    # original script (Trainer itself logs to default_root_dir).
-    TensorBoardLogger(save_dir=str(output_dir), name="carbon_flux")
-    # Descriptive run name (with the run timestamp) so re-runs of the same
-    # (T_HLS, T_MERRA, seed) combo stay distinguishable in the dashboard, and it
-    # matches the output folder. log_model=False -> no checkpoint artifacts.
     run_name = (
         f"{model_name}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}"
         f"_{ts}"

@@ -28,7 +28,7 @@ training:
   bn: 1
 testing:
   test_batch_size: 16
-  shuffle: False
+  shuffle: True
 normalization: "z-score-std"
 # Resolved per-run by the runner (see train.py); placeholders here document the shape.
 T_HLS:            # int, number of HLS frames per window (single-frame SM uses 1)

@@ -398,13 +398,15 @@ class sm_dataloader(LightningModule):
         return DataLoader(self.dataset_train, batch_size=self.train_batch_size,
                           shuffle=self.config["training"]["shuffle"])
 
-    def test_dataloader(self):
+    # val returning val loss and for wandb logging
+    def val_dataloader(self):
         return DataLoader(self.dataset_test, batch_size=self.test_batch_size,
                           shuffle=self.config["testing"]["shuffle"])
 
+    # predict is used for storing output per sample
     def predict_dataloader(self):
         return DataLoader(self.dataset_test, batch_size=self.test_batch_size,
-                          shuffle=self.config["testing"]["shuffle"])
+                          shuffle=False)
 
 
 if __name__ == "__main__":
