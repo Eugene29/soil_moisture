@@ -26,7 +26,7 @@ from lightning.pytorch.callbacks import (
     ModelCheckpoint,
     RichProgressBar,
 )
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from terratorch.models.backbones.prithvi_mae import PrithviViT
 from terratorch.tasks import PixelwiseRegressionTask
 
@@ -227,7 +227,7 @@ def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
     return task
 
 
-def build_trainer(cfg, task, output_dir):
+def build_trainer(cfg, task, output_dir, model_name, ts):
     """Construct the Lightning Trainer with the run's callbacks and logger."""
     print("building a trainer...")
     checkpoint_callback = ModelCheckpoint(
@@ -236,6 +236,20 @@ def build_trainer(cfg, task, output_dir):
     # Logger created for its side effect of fixing the log dir layout, as in the
     # original script (Trainer itself logs to default_root_dir).
     TensorBoardLogger(save_dir=str(output_dir), name="carbon_flux")
+    # Descriptive run name (with the run timestamp) so re-runs of the same
+    # (T_HLS, T_MERRA, seed) combo stay distinguishable in the dashboard, and it
+    # matches the output folder. log_model=False -> no checkpoint artifacts.
+    run_name = (
+        f"{model_name}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}"
+        f"_{ts}"
+    )
+    wandb_logger = WandbLogger(
+        project="soil_moisture",
+        name=run_name,
+        log_model=False,
+        save_dir=str(output_dir),
+    )
+    wandb_logger.experiment.config.update(cfg) 
 
     trainer = Trainer(
         accelerator="cuda",
@@ -247,9 +261,10 @@ def build_trainer(cfg, task, output_dir):
         max_epochs=cfg["n_iteration"],
         default_root_dir=str(output_dir),
         log_every_n_steps=1,
-        check_val_every_n_epoch=200,
+        check_val_every_n_epoch=1,
+        logger=wandb_logger,
     )
-    return trainer
+    return trainer, wandb_logger
 
 
 def evaluate_split(
@@ -315,6 +330,7 @@ def run(
     output_dir,
     manually_parse_weights,
     cfg,
+    ts,
 ):
     set_seed(cfg["seed"])
 
@@ -322,7 +338,7 @@ def run(
      sm_mean, sm_std) = build_data(cfg, output_dir)
 
     task = build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights)
-    trainer = build_trainer(cfg, task, output_dir)
+    trainer, wandb_logger = build_trainer(cfg, task, output_dir, model_name, ts)
 
     # zeroshot eval -> fit -> post-training eval on the test and train splits.
     zs = evaluate_split(
@@ -340,7 +356,9 @@ def run(
     )
 
     metrics = save_metrics(zs, test, train, cfg, output_dir)
-    print(f'  test R2={test["r2_unnorm"]:.4f}  train R2={train["r2_unnorm"]:.4f}')
+    wandb_logger.log_metrics(metrics)
+    wandb_logger.experiment.finish()
+    print(f'test R2={test["r2_unnorm"]:.4f}  train R2={train["r2_unnorm"]:.4f}')
     return metrics
 
 
@@ -437,7 +455,7 @@ def main():
         run_dir = (
             output_root
             / model_name
-            / f"thls_{T_HLS}_tmerra_{T_MERRA}_seed_{seed}"
+            / f"thls_{T_HLS}_tmerra_{T_MERRA}"
             / ts
         )
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -452,6 +470,7 @@ def main():
             output_dir=run_dir,
             manually_parse_weights=manually_parse_weights,
             cfg=cfg,
+            ts=ts,
         )
         summary_rows.append({"model": model_name, **metrics})
         pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
