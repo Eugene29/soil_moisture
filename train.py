@@ -36,6 +36,24 @@ from data_loader.data_loader import *
 from preprocess.compute_data_stats import hls_stats, col_stats
 
 
+def apply_cli_overrides(cfg, args):
+    """Override config values only for CLI args that were actually passed.
+
+    The YAML holds the real defaults; each override-able arg defaults to None in
+    argparse, so None means "not passed -- keep the config value".
+    # TODO: override with hydra for cleaner code
+    """
+    if args.t_hls is not None:
+        cfg["T_HLS"] = args.t_hls
+    if args.t_merra is not None:
+        cfg["T_MERRA"] = args.t_merra
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    if args.modality is not None:
+        cfg["modality"] = args.modality
+    return cfg
+
+
 def load_merra_frame(stations, merra_root):
     """Load + merge MERRA for a set of stations into one MultiIndexed DataFrame.
 
@@ -81,18 +99,22 @@ def dummy_sm_stats():
     )
 
 
-def compute_sm_stats(train_df, chips_root, merra_train, output_dir):
-    """Compute train-split-only normalization stats for the SM task and save them.
+def compute_sm_stats(train_df, chips_root, merra_train, output_dir, modality):
+    """Compute train-split-only normalization stats for the active modality.
 
-    HLS stats are per-band over one resolved chip per train row. We seed the
-    global numpy RNG first so the chip resolution here is reproducible. MERRA
-    stats are over the per-row overpass-time vectors; SM stats over the
-    soil_moisture column. The same stats normalize train AND test, so the held-out
-    split never leaks into normalization. Stats are written to the run's output
-    dir (they are bound to this split/seed), and also returned in-memory.
+    HLS stats are per-band over one resolved chip per train row (only when HLS is
+    used). MERRA stats are over the per-row overpass-time vectors (only when MERRA
+    is used); the chip is resolved either way to drive the MERRA lookup time. SM
+    stats are always computed. The same stats normalize train AND test, so the
+    held-out split never leaks into normalization. Stats are written to the run's
+    output dir (bound to this split/seed) and also returned in-memory; excluded
+    modalities get identity stats (mean 0, std 1).
     """
-    # HLS + MERRA: resolve one chip per train row (its overpass time drives the
-    # MERRA lookup), accumulate chip paths and MERRA vectors together.
+    # TODO: make the compute of stats modular and also look where you can add modularity for nicer code. 
+    use_hls = modality in ("hls", "both")
+    use_merra = modality in ("merra", "both")
+
+    # Resolve one chip per train row; its overpass time drives the MERRA lookup.
     chip_paths = []
     merra_rows = []
     for _, row in train_df.iterrows():
@@ -100,30 +122,43 @@ def compute_sm_stats(train_df, chips_root, merra_train, output_dir):
         day = datetime.fromisoformat(str(row["date"])).date()
         chip = resolve_chip(network, station, day, chips_root)
         chip_paths.append(chip)
-        merra_rows.append(
-            merra_vector(merra_train, network, station, overpass_datetime(chip))
-        )
-    # chips_dir="" so hls_stats uses the absolute paths as-is.
-    means, stds = hls_stats(chip_paths, chips_dir="")
+        if use_merra:
+            merra_rows.append(
+                merra_vector(merra_train, network, station, overpass_datetime(chip))
+            )
 
-    merra_rows = np.stack(merra_rows)
-    merra_means = merra_rows.mean(axis=0)
-    merra_stds = merra_rows.std(axis=0, ddof=1)
+    if use_hls:
+        # chips_dir="" so hls_stats uses the absolute paths as-is.
+        means, stds = hls_stats(chip_paths, chips_dir="")
+    else:
+        means = np.zeros(6, dtype=np.float32)
+        stds = np.ones(6, dtype=np.float32)
+
+    if use_merra:
+        merra_rows = np.stack(merra_rows)
+        merra_means = merra_rows.mean(axis=0)
+        merra_stds = merra_rows.std(axis=0, ddof=1)
+    else:
+        merra_means = np.zeros(len(MERRA_COLS), dtype=np.float32)
+        merra_stds = np.ones(len(MERRA_COLS), dtype=np.float32)
 
     # SM target: mean/std of the soil_moisture column (ddof=1).
     sm_mean, sm_std = col_stats(train_df, ["soil_moisture"])
 
     stats = {
         "provenance": {
+            "modality": modality,
             "n_train_rows": int(len(train_df)),
             "n_train_stations": int(train_df.groupby(["network", "station"]).ngroups),
             "merra_cols": MERRA_COLS,
             "computed_at": datetime.now().isoformat(timespec="seconds"),
         },
-        "hls": {"means": means.tolist(), "stds": stds.tolist()},
-        "merra": {"means": merra_means.tolist(), "stds": merra_stds.tolist()},
         "sm": {"mean": sm_mean.tolist(), "std": sm_std.tolist()},
     }
+    if use_hls:
+        stats["hls"] = {"means": means.tolist(), "stds": stds.tolist()}
+    if use_merra:
+        stats["merra"] = {"means": merra_means.tolist(), "stds": merra_stds.tolist()}
     with open(Path(output_dir) / "stats.json", "w") as f:
         json.dump(stats, f, indent=2)
 
@@ -138,35 +173,46 @@ def build_data(cfg, output_dir):
     test_batch_size = cfg["testing"]["test_batch_size"]
     chips_root = cfg_data["chips_root"]
     merra_root = cfg_data["merra_root"]
+    modality = cfg["modality"]
+    use_merra = modality in ("merra", "both")
 
     df = pd.read_csv(cfg_data["master_csv"])
     df = df[df["has_HLS"] == 1].reset_index(drop=True)
+    # TODO: for a pure MERRA-only experiment this has_HLS filter can be relaxed
+    #       to use all SM rows; kept on for now so the HLS/MERRA/both ablation
+    #       compares the three on the identical sample.
 
     # Spatial (by-station) split -- leakage-safe.
     train_df, test_df = spatial_split(df, test_fraction=cfg_data.get("test_fraction", 0.2))
     print(f"SM split: train rows={len(train_df)}  test rows={len(test_df)}")
 
-    # Load MERRA once per split (read + LND/SLV merge), indexed by station.
-    train_stations = list(train_df[["network", "station"]].drop_duplicates().itertuples(index=False, name=None))
-    test_stations = list(test_df[["network", "station"]].drop_duplicates().itertuples(index=False, name=None))
-    merra_train = load_merra_frame(train_stations, merra_root)
-    merra_test = load_merra_frame(test_stations, merra_root)
+    # Load MERRA once per split (read + LND/SLV merge), indexed by station -- only
+    # when the modality uses it.
+    if use_merra:
+        train_stations = list(train_df[["network", "station"]].drop_duplicates().itertuples(index=False, name=None))
+        test_stations = list(test_df[["network", "station"]].drop_duplicates().itertuples(index=False, name=None))
+        merra_train = load_merra_frame(train_stations, merra_root)
+        merra_test = load_merra_frame(test_stations, merra_root)
+    else:
+        merra_train = merra_test = None
 
     if cfg.get("debug", False):
         print("debug=True -- skipping compute_sm_stats, using dummy stats")
         means, stds, merra_means, merra_stds, sm_mean, sm_std = dummy_sm_stats()
     else:
         means, stds, merra_means, merra_stds, sm_mean, sm_std = compute_sm_stats(
-            train_df, chips_root, merra_train, output_dir
+            train_df, chips_root, merra_train, output_dir, modality
         )
 
     sm_dataset_train = sm_dataset(
         train_df, chips_root, merra_train,
         means, stds, merra_means, merra_stds, sm_mean, sm_std,
+        modality=modality,
     )
     sm_dataset_test = sm_dataset(
         test_df, chips_root, merra_test,
         means, stds, merra_means, merra_stds, sm_mean, sm_std,
+        modality=modality,
     )
 
     datamodule = sm_dataloader(
@@ -188,39 +234,49 @@ def build_data(cfg, output_dir):
 
 
 def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
-    """Assemble the frozen Prithvi encoder + regression head into a Lightning task."""
+    """Assemble the active-modality model into a Lightning task.
+
+    The frozen Prithvi encoder is built only when HLS is used; merra-only skips
+    it entirely (no weight load, no encoder).
+    """
     print("building a model...")
     cfg_model = cfg["model"]
     T_HLS = cfg["T_HLS"]
     T_MERRA = cfg["T_MERRA"]
+    modality = cfg["modality"]
+    use_hls = modality in ("hls", "both")
 
-    coords_encoding = ["time", "location"] if use_TL_encoding else []
-
-    prithvi_instance = PrithviViT(
-        patch_size=cfg_model["patch_size"],
-        num_frames=T_HLS,
-        in_chans=cfg_model["n_channel"],
-        embed_dim=cfg_model["embed_dim"],
-        num_heads=cfg_model["num_heads"],
-        mlp_ratio=cfg_model["mlp_ratio"],
-        head_dropout=cfg_model["head_dropout"],
-        backbone_input_size=[T_HLS, 50, 50],
-        encoder_only=False,
-        padding=True,
-        depth=cfg_model["depth"],
-        coords_encoding=coords_encoding,
-    )
-    prithvi_model = prithvi_terratorch(
-        wt_file,
-        prithvi_instance,
-        manually_parse_weights=manually_parse_weights,
-        use_TL_encoding=use_TL_encoding,
-    )
-    prithvi_model.freeze_encoder()
-
+    prithvi_model = None
     # Encoder emits (patches_per_frame * T_HLS + 1) tokens; padded 50x50 / patch 16 -> 3x3 = 9 patches/frame.
     n_tokens = 9 * T_HLS + 1
-    model_comb = RegressionModelSM(prithvi_model, n_tokens=n_tokens, T_MERRA=T_MERRA)
+    if use_hls:
+        coords_encoding = ["time", "location"] if use_TL_encoding else []
+
+        prithvi_instance = PrithviViT(
+            patch_size=cfg_model["patch_size"],
+            num_frames=T_HLS,
+            in_chans=cfg_model["n_channel"],
+            embed_dim=cfg_model["embed_dim"],
+            num_heads=cfg_model["num_heads"],
+            mlp_ratio=cfg_model["mlp_ratio"],
+            head_dropout=cfg_model["head_dropout"],
+            backbone_input_size=[T_HLS, 50, 50],
+            encoder_only=False,
+            padding=True,
+            depth=cfg_model["depth"],
+            coords_encoding=coords_encoding,
+        )
+        prithvi_model = prithvi_terratorch(
+            wt_file,
+            prithvi_instance,
+            manually_parse_weights=manually_parse_weights,
+            use_TL_encoding=use_TL_encoding,
+        )
+        prithvi_model.freeze_encoder()
+
+    model_comb = RegressionModelSM(
+        prithvi_model, n_tokens=n_tokens, T_MERRA=T_MERRA, modality=modality
+    )
     task = PixelwiseRegressionTask(
         None, None, model=model_comb, loss="mse", optimizer="AdamW"
     )
@@ -234,7 +290,7 @@ def build_trainer(cfg, task, output_dir, model_name, ts):
         monitor=task.monitor, save_top_k=1, save_last=True
     )
     run_name = (
-        f"{model_name}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}"
+        f"{model_name}_{cfg['modality']}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}"
         f"_{ts}"
     )
     wandb_logger = WandbLogger(
@@ -301,20 +357,17 @@ def save_metrics(zs, test, train, cfg, output_dir):
         json.dump(metrics, f, indent=2)
     return metrics
 
-def read_and_save_config(cfg_fname, T_HLS, T_MERRA, output_dir, seed=0):
-    ### Read model configs from YAML and stamp in this run's resolved values.
+def read_and_save_config(cfg_fname):
+    """Read model configs from YAML"""
     with open(cfg_fname, "r") as file:
         cfg = yaml.safe_load(file)
-    cfg["T_HLS"] = T_HLS
-    cfg["T_MERRA"] = T_MERRA
-    cfg["seed"] = seed
+    return cfg
 
-    # Snapshot the resolved config before any in-place numpy conversions below,
-    # so the dumped file stays plain YAML (no numpy/Path tags).
+
+def save_resolved_config(cfg, output_dir):
+    """Snapshot the resolved config (post-override) as plain YAML."""
     with open(output_dir / "config.yaml", "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
-    
-    return cfg
 
 
 def run(
@@ -356,122 +409,68 @@ def run(
     return metrics
 
 
-class ModelConfig(NamedTuple):
-    model_name: str
-    config_fname: str
-    wt_file: str
-    use_TL_encoding: bool
-    T_HLS: int = 1
-    T_MERRA: int = 1
-    seed: int = 0
-    # years: list[int]
-
-
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--dev", default="1")
-    parser.add_argument("--t-hls", type=int, default=1)
-    parser.add_argument("--t-merra", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--t-hls", type=int, default=None)
+    parser.add_argument("--t-merra", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--modality", choices=["hls", "merra", "both"], default=None)
     parser.add_argument("--tl-encoding", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     warnings.filterwarnings("ignore")
     os.chdir(Path(__file__).absolute().parent)
-
     # only use one gpu for now as I'm seeing distributed sampling issue.
     os.environ["CUDA_VISIBLE_DEVICES"] = args.dev
 
-    # Single config driven by CLI args; the grid + GPU scheduling lives in the
-    # launcher (launch_sweep.sh), which fans these out one-per-GPU.
+    # TODO: add flags to change model variation.
+    config_fname = "fluxconfig_trainer.yaml"
+    wt_file = "/home/yjean234/Azad/Prithvi-EO-2.0/examples/carbon_flux/Prithvi_EO_V2_300M_TL.pt"
+    manually_parse_weights = True
     model_name = "Prithvi-EO-2.0-300M-TL" if args.tl_encoding else "Prithvi-EO-2.0-300M"
-    model_configs = [
-        # (model_name, config_fname, wt_file, use_TL_encoding, T_HLS, T_MERRA, seed)
-        ModelConfig(
-            model_name,
-            "fluxconfig_trainer.yaml",
-            "/home/yjean234/Azad/Prithvi-EO-2.0/examples/carbon_flux/Prithvi_EO_V2_300M_TL.pt",
-            args.tl_encoding,
-            args.t_hls,
-            args.t_merra,
-            args.seed,
-        )
-    ]
 
-    # --- Toggle: original T_HLS x T_MERRA sweep (9 runs, single seed) ---
-    # model_configs = [
-    #     # (model_name, config_fname, wt_file, use_TL_encoding, T_HLS, T_MERRA)
-    #     ModelConfig(
-    #         "Prithvi-EO-2.0-300M",
-    #         "fluxconfig_trainer.yaml",
-    #         "Prithvi_EO_V2_300M_TL.pt",
-    #         False,
-    #         x,
-    #         y,
-    #     ) for x, y, in itertools.product([1, 4, 7], [1, 7, 14])
-    # ]
-    # model_configs = [
-    #     # (model_name, config_fname, wt_file, use_TL_encoding)
-    #     ('Prithvi-EO-2.0-300M',    'fluxconfig_trainer.yaml',       'Prithvi_EO_V2_300M_TL.pt', False),
-    #     ('Prithvi-EO-2.0-300M-TL', 'fluxconfig_trainer.yaml',       'Prithvi_EO_V2_300M_TL.pt', True),
-    #     ('Prithvi-EO-2.0-600M',    'fluxconfig_trainer_large.yaml', 'Prithvi_EO_V2_600M_TL.pt', False),
-    #     ('Prithvi-EO-2.0-600M-TL', 'fluxconfig_trainer_large.yaml', 'Prithvi_EO_V2_600M_TL.pt', True),
-    # ]
+    cfg = read_and_save_config(config_fname)
+    cfg = apply_cli_overrides(cfg, args)
+    cfg["debug"] = args.debug
+    modality = cfg["modality"]
 
     output_root = Path("outputs")
-    manually_parse_weights = True
-
     output_root.mkdir(exist_ok=True)
-    # Per-process summary so parallel one-per-GPU launches don't clobber each other.
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = (
+        output_root / model_name / modality
+        / f"thls_{cfg['T_HLS']}_tmerra_{cfg['T_MERRA']}" / ts
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    save_resolved_config(cfg, run_dir)
+
+    print(
+        f"\n=== {model_name} | modality {modality} "
+        f"| T_HLS {cfg['T_HLS']} | T_MERRA {cfg['T_MERRA']} | seed {cfg['seed']} ==="
+    )
+    metrics = run(
+        model_name=model_name,
+        wt_file=wt_file,
+        use_TL_encoding=args.tl_encoding,
+        output_dir=run_dir,
+        manually_parse_weights=manually_parse_weights,
+        cfg=cfg,
+        ts=ts,
+    )
+
+    # Per-process summary so parallel launches don't clobber each other.
     tl_tag = "_tl" if args.tl_encoding else ""
     summary_path = (
         output_root
-        / f"summary_thls{args.t_hls}_tmerra{args.t_merra}_seed{args.seed}{tl_tag}.csv"
+        / f"summary_{modality}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}_seed{cfg['seed']}{tl_tag}.csv"
     )
-
-    summary_rows = []
-    for (
-        model_name,
-        config_fname,
-        wt_file,
-        use_TL_encoding,
-        T_HLS,
-        T_MERRA,
-        seed,
-    ) in model_configs:
-        print(
-            f"\n=== {model_name} | T_HLS {T_HLS} | T_MERRA {T_MERRA} | seed {seed} ==="
-        )
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = (
-            output_root
-            / model_name
-            / f"thls_{T_HLS}_tmerra_{T_MERRA}"
-            / ts
-        )
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        cfg = read_and_save_config(config_fname, T_HLS, T_MERRA, run_dir, seed)
-        cfg["debug"] = args.debug
-
-        metrics = run(
-            model_name=model_name,
-            wt_file=wt_file,
-            use_TL_encoding=use_TL_encoding,
-            output_dir=run_dir,
-            manually_parse_weights=manually_parse_weights,
-            cfg=cfg,
-            ts=ts,
-        )
-        summary_rows.append({"model": model_name, **metrics})
-        pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
-
-        print(f"Run output dir at {run_dir.absolute()}")
-
-    print(f"\nWrote summary to {summary_path}")
+    pd.DataFrame([{"model": model_name, "modality": modality, **metrics}]).to_csv(
+        summary_path, index=False
+    )
+    print(f"Run output dir at {run_dir.absolute()}")
+    print(f"Wrote summary to {summary_path}")
 
 
 if __name__ == "__main__":

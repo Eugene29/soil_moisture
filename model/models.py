@@ -393,40 +393,52 @@ class Pt1dConvBranch(nn.Module):
         x = self.fc(x)                 # [B, 8]         -> [B, 64]
         return x
 
-# Simple regression head: concatenate the Prithvi (HLS) and MERRA branches and
-# regress to a single scalar -- the soil-moisture (SM) target.
+# Simple regression head: concatenate the active branch(es) and regress to a
+# single scalar -- the soil-moisture (SM) target. `modality` selects which
+# branches are built (hls | merra | both); each branch emits a 64-dim vector.
 class RegressionModelSM(LightningModule):
-    def __init__(self, prithvi_model, n_tokens=10, T_MERRA=1):
+    def __init__(self, prithvi_model, n_tokens=10, T_MERRA=1, modality="both"):
         super(RegressionModelSM, self).__init__()
-        self.prithvi_model = prithvi_model
-        prithvi_emb_dim = self.prithvi_model.prithvi_model.embed_dim
-        self.decoder = SimpleDecoder_comb_v2(
-            prithvi_emb_dim, hidden_dim=256, output_dim=64, n_tokens=n_tokens
-        )
-        self.pt1d_conv_branch = Pt1dConvBranch(T_MERRA=T_MERRA)
-        self.fc_final = nn.Linear(128, 1)  # Regression output
+        assert modality in ("hls", "merra", "both"), f"bad modality {modality}"
+        self.modality = modality
+        self.use_hls = modality in ("hls", "both")
+        self.use_merra = modality in ("merra", "both")
 
-    def forward(self, im2d, pt1d, temporal_coords=None, location_coords=None, **kwargs):
-        # The MERRA conv branch expects [B, n_vars, T]. The single-frame SM loader
-        # emits pt1d as [B, n_vars] (no time axis), so add a singleton T=1 axis.
-        if pt1d.dim() == 2:
-            pt1d = pt1d.unsqueeze(-1)  # [B, n_vars] -> [B, n_vars, 1]
-        if im2d.dim() == 4:
-            im2d = im2d.unsqueeze(2)  # [B, n_vars] -> [B, n_vars, 1]
+        self.prithvi_model = None
+        self.decoder = None
+        self.pt1d_conv_branch = None
 
-        # Pass HLS im2d through the pretrained prithvi MAE encoder (with frozen weights).
-        # temporal_coords / location_coords are no-ops unless the backbone was built with coords_encoding.
-        pri_enc = self.prithvi_model(im2d, temporal_coords, location_coords, 0)
+        feat_dim = 0
+        if self.use_hls:
+            self.prithvi_model = prithvi_model
+            prithvi_emb_dim = self.prithvi_model.prithvi_model.embed_dim
+            self.decoder = SimpleDecoder_comb_v2(
+                prithvi_emb_dim, hidden_dim=256, output_dim=64, n_tokens=n_tokens
+            )
+            feat_dim += 64
+        if self.use_merra:
+            self.pt1d_conv_branch = Pt1dConvBranch(T_MERRA=T_MERRA)
+            feat_dim += 64
 
-        # Pass pri_enc through the simple decoder
-        dec_out = self.decoder(pri_enc)  # op Shape [batch_size, 64]
-        # Pass MERRA pt1d through the convolutional layers
-        pt1d_out = self.pt1d_conv_branch(pt1d)  # Shape [batch_size, 64]
-        # Concatenate decoder output and pt1d output
-        combined = torch.cat((dec_out[:, :], pt1d_out), dim=1) # op: [batch x 128]
-        # Final regression output
-        output1 = self.fc_final(combined)  # Shape [batch_size, 1]
-        #output2 = self.fc_final2(output1)  # Shape [batch_size, 1]
-        output = ModelOutput(output=output1)
-        
-        return output
+        self.fc_final = nn.Linear(feat_dim, 1)  # Regression output
+
+    def forward(self, im2d, pt1d=None, temporal_coords=None, location_coords=None, **kwargs):
+        feats = []
+        if self.use_hls:
+            # The single-frame SM loader emits im2d as [B, C, H, W]; add a
+            # singleton T axis for the 3D patch embed. temporal/location coords
+            # are no-ops unless the backbone was built with coords_encoding.
+            if im2d.dim() == 4:
+                im2d = im2d.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
+            pri_enc = self.prithvi_model(im2d, temporal_coords, location_coords, 0)
+            feats.append(self.decoder(pri_enc))        # [B, 64]
+        if self.use_merra:
+            # The MERRA conv branch expects [B, n_vars, T]; the loader emits
+            # pt1d as [B, n_vars], so add a singleton T=1 axis.
+            if pt1d.dim() == 2:
+                pt1d = pt1d.unsqueeze(-1)              # [B, n_vars] -> [B, n_vars, 1]
+            feats.append(self.pt1d_conv_branch(pt1d))  # [B, 64]
+
+        combined = torch.cat(feats, dim=1) if len(feats) > 1 else feats[0]
+        output1 = self.fc_final(combined)              # [B, 1]
+        return ModelOutput(output=output1)

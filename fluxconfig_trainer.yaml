@@ -30,9 +30,10 @@ testing:
   test_batch_size: 16
   shuffle: True
 normalization: "z-score-std"
-# Resolved per-run by the runner (see train.py); placeholders here document the shape.
-T_HLS:            # int, number of HLS frames per window (single-frame SM uses 1)
-T_MERRA:          # int, number of MERRA frames per window (single-frame SM uses 1)
+T_HLS: 1          # int, number of HLS frames per window (single-frame SM uses 1)
+T_MERRA: 1        # int, number of MERRA frames per window (single-frame SM uses 1)
+seed: 0
+modality: "both"   # one of: hls | merra | both -- which data source(s) to use
 data:
   # Soil-moisture (SM) data. Normalization stats are computed at runtime from the
   # train split (see train.py: compute_sm_stats) and written to the run's output dir.

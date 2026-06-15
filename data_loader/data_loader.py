@@ -210,7 +210,8 @@ class sm_dataset(NonGeoDataset):
     """
 
     def __init__(self, rows, chips_root, merra_df,
-                 means, stds, merra_means, merra_stds, sm_mean, sm_std):
+                 means, stds, merra_means, merra_stds, sm_mean, sm_std,
+                 modality="both"):
         # rows: a DataFrame of filtered master-CSV rows (has_HLS==1).
         # merra_df: per-split MERRA frame, MultiIndexed on (network, station),
         #           with a `time` column and all MERRA_COLS (LND+SLV merged).
@@ -224,6 +225,10 @@ class sm_dataset(NonGeoDataset):
         self.sm_mean = np.asarray(sm_mean)
         self.sm_std = np.asarray(sm_std)
         # Random tile selection uses the global numpy RNG (seeded by set_seed).
+        assert modality in ("hls", "merra", "both"), f"bad modality {modality}"
+        self.modality = modality
+        self.use_hls = modality in ("hls", "both")
+        self.use_merra = modality in ("merra", "both")
 
     def __len__(self):
         return len(self.rows)
@@ -235,41 +240,45 @@ class sm_dataset(NonGeoDataset):
         network, station = str(row["network"]), str(row["station"])
         day = date.fromisoformat(str(row["date"]))
 
-        # --- HLS: resolve one chip on the fly, read, per-band z-score ---
+        # Resolve the chip path in any modality: HLS reads its pixels, and MERRA
+        # is keyed off the chip's overpass time, so the path is needed even in
+        # merra-only (the has_HLS==1 filter guarantees a chip exists).
+        # TODO: use the actual soil-moisture measurement time when available;
+        #       currently unobtainable, so MERRA is keyed off the HLS overpass
+        #       time (from the chip filename) to stay comparable with `both`.
         chip_path = resolve_chip(network, station, day, self.chips_root)
-        image, center_lonlat = load_raster(
-            chip_path, crop=(50, 50), return_center_lonlat=True
-        )
-        image = preprocess_image(image, self.means, self.stds)  # (C, H, W)
 
-        # --- MERRA: vector nearest the HLS overpass time, per-variable z-score ---
-        when = overpass_datetime(chip_path)
-        merra = merra_vector(self.merra_df, network, station, when)  # (n_vars,)
-        merra_norm = (merra - self.merra_means) / self.merra_stds
-        merra_norm = torch.from_numpy(merra_norm.astype(np.float32))
+        # --- HLS: read + per-band z-score (only when used) ---
+        if self.use_hls:
+            image, center_lonlat = load_raster(
+                chip_path, crop=(50, 50), return_center_lonlat=True
+            )
+            image = preprocess_image(image, self.means, self.stds)  # (C, H, W)
+            image = image.to(torch.float)
+        else:
+            # terratorch's PixelwiseRegressionTask hard-requires batch["image"];
+            # emit a tiny dummy placeholder that the merra-only model ignores.
+            image = torch.zeros(1, dtype=torch.float)
 
-        # --- SM target: z-score ---
+        # --- SM target: z-score (always) ---
         sm = (float(row["soil_moisture"]) - self.sm_mean) / self.sm_std
         sm = torch.from_numpy(np.asarray(sm, dtype=np.float32).reshape(1))
 
-        # # TODO: pipeline the TL-encoding codepath. 
-        # lon, lat = center_lonlat
-        # location_coords = torch.tensor([float(lat), float(lon)], dtype=torch.float32)
-        # # Single-frame temporal coords: one (year, doy0) pair -> shape (1, 2).
-        # temporal_coords = torch.tensor(
-        #     [[float(day.year), float(day.timetuple().tm_yday) - 1.0]],
-        #     dtype=torch.float32,
-        # )
-
-        return {
-            "image": image.to(torch.float),
-            "pt1d": merra_norm.to(torch.float),
+        sample = {
+            "image": image,
             "mask": sm.to(torch.float),
             "filename": chip_path,
-            # TODO: TBD
-            # "location_coords": location_coords,
-            # "temporal_coords": temporal_coords,
         }
+
+        # --- MERRA: vector nearest the HLS overpass time, per-variable z-score ---
+        if self.use_merra:
+            when = overpass_datetime(chip_path)
+            merra = merra_vector(self.merra_df, network, station, when)  # (n_vars,)
+            merra_norm = (merra - self.merra_means) / self.merra_stds
+            merra_norm = torch.from_numpy(merra_norm.astype(np.float32))
+            sample["pt1d"] = merra_norm.to(torch.float)
+
+        return sample
 
 
 # ---------------------------------------------------------------------------
