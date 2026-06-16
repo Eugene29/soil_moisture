@@ -388,25 +388,50 @@ class Pt1dConvBranch(nn.Module):
 # Simple regression head: concatenate the active branch(es) and regress to a
 # single scalar -- the soil-moisture (SM) target. `modality` selects which
 # branches are built (hls | merra | both); each branch emits a 64-dim vector.
+class HlsPixelBranch(nn.Module):
+    """MLP over the 6-band HLS reflectance at the single ISMN-location pixel."""
+    def __init__(self, n_bands=6):
+        super().__init__()
+        h_dim = 64
+        self.net = nn.Sequential(
+            nn.Linear(n_bands, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, 64),
+        )
+
+    def forward(self, x):  # x: [B, n_bands] -> [B, 64]
+        return self.net(x)
+
+
 class RegressionModelSM(LightningModule):
-    def __init__(self, prithvi_model, n_tokens=10, T_MERRA=1, modality="both"):
+    def __init__(self, prithvi_model, n_tokens=10, T_MERRA=1, modality="both",
+                 hls_mode="chip"):
         super(RegressionModelSM, self).__init__()
         assert modality in ("hls", "merra", "both"), f"bad modality {modality}"
+        assert hls_mode in ("chip", "pixel"), f"bad hls_mode {hls_mode}"
         self.modality = modality
+        self.hls_mode = hls_mode
         self.use_hls = modality in ("hls", "both")
         self.use_merra = modality in ("merra", "both")
+        # HLS spatial extent: full chip via Prithvi, or single pixel via MLP.
+        self.use_chip = self.use_hls and hls_mode == "chip"
+        self.use_pixel = self.use_hls and hls_mode == "pixel"
 
         self.prithvi_model = None
         self.decoder = None
+        self.hls_pixel_branch = None
         self.pt1d_conv_branch = None
 
         feat_dim = 0
-        if self.use_hls:
+        if self.use_chip:
             self.prithvi_model = prithvi_model
             prithvi_emb_dim = self.prithvi_model.prithvi_model.embed_dim
             self.decoder = SimpleDecoder_comb_v2(
                 prithvi_emb_dim, hidden_dim=256, output_dim=64, n_tokens=n_tokens
             )
+            feat_dim += 64
+        if self.use_pixel:
+            self.hls_pixel_branch = HlsPixelBranch(n_bands=6)
             feat_dim += 64
         if self.use_merra:
             self.pt1d_conv_branch = Pt1dConvBranch(T_MERRA=T_MERRA)
@@ -414,9 +439,10 @@ class RegressionModelSM(LightningModule):
 
         self.fc_final = nn.Linear(feat_dim, 1)  # Regression output
 
-    def forward(self, im2d, pt1d=None, temporal_coords=None, location_coords=None, **kwargs):
+    def forward(self, im2d, pt1d=None, hls_pixel=None, temporal_coords=None,
+                location_coords=None, **kwargs):
         feats = []
-        if self.use_hls:
+        if self.use_chip:
             # The single-frame SM loader emits im2d as [B, C, H, W]; add a
             # singleton T axis for the 3D patch embed. temporal/location coords
             # are no-ops unless the backbone was built with coords_encoding.
@@ -424,6 +450,8 @@ class RegressionModelSM(LightningModule):
                 im2d = im2d.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
             pri_enc = self.prithvi_model(im2d, temporal_coords, location_coords, 0)
             feats.append(self.decoder(pri_enc))        # [B, 64]
+        if self.use_pixel:
+            feats.append(self.hls_pixel_branch(hls_pixel))  # [B, 64]
         if self.use_merra:
             # The MERRA conv branch expects [B, n_vars, T]; the loader emits
             # pt1d as [B, n_vars], so add a singleton T=1 axis.

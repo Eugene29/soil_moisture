@@ -10,8 +10,11 @@ mkdir -p $log
 time=$(date +%s)
 echo Writing log in direcotry: $log...
 
-python train.py --modality both  --t-hls 1 --t-merra 1 --seed 0 --dev 0 &> $log/${time}0.txt &
-# python train.py --modality hls   --t-hls 1             --seed 0 --dev 1 &> $log/${time}1.txt # &
-# python train.py --modality hls   --t-hls 1             --seed 0 --dev 2 &> $log/${time}1.txt # &
-# python train.py --modality merra           --t-merra 1 --seed 0 --dev 2 &> $log/${time}2.txt &
+python train.py --modality both  --t-hls 1 --t-merra 1 --dev 0 --train-mode frozen &> $log/${time}0.txt &
+python train.py --modality both  --t-hls 1 --t-merra 1 --dev 1 --train-mode finetune &> $log/${time}1.txt &
+python train.py --modality both  --t-hls 1 --t-merra 1 --dev 2 --train-mode scratch &> $log/${time}2.txt &
+
+# python train.py --modality hls   --t-hls 1             --dev 1 &> $log/${time}1.txt # &
+# python train.py --modality hls   --t-hls 1             --dev 2 &> $log/${time}1.txt # &
+# python train.py --modality merra           --t-merra 1 --dev 2 &> $log/${time}2.txt &
 wait

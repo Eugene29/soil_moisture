@@ -34,6 +34,7 @@ from torchgeo.datasets import NonGeoDataset
 import rasterio
 
 from rasterio.warp import transform as warp_transform
+from rasterio.windows import Window
 from torch.utils.data import DataLoader
 
 
@@ -158,6 +159,28 @@ def load_raster(path, crop=None, return_center_lonlat=False):
         return img
 
 
+def load_pixel(path, lon, lat):
+    """Read the 6 HLS bands at the single (lon, lat) pixel of a chip.
+
+    Reprojects the station's EPSG:4326 (lon, lat) into the chip CRS, maps it to a
+    (row, col) with rasterio's affine index, and reads a 1x1 window -- so only the
+    one pixel covering the ISMN location is touched (cheap, no full-chip read).
+    Returns a float32 array of shape (6,). NaN gaps are remapped to NO_DATA_FLOAT
+    (matching load_raster). Raises if the location falls outside the raster.
+    """
+    with rasterio.open(path) as src:
+        x, y = warp_transform("EPSG:4326", src.crs, [lon], [lat])
+        row, col = src.index(x[0], y[0])
+        if not (0 <= row < src.height and 0 <= col < src.width):
+            raise IndexError(
+                f"({lon}, {lat}) -> (row={row}, col={col}) outside "
+                f"{src.width}x{src.height} raster {os.path.basename(path)}"
+            )
+        img = src.read(window=Window(col, row, 1, 1))[0:6, 0, 0]  # (6,)
+    img = np.where(np.isnan(img), NO_DATA_FLOAT, img)
+    return img.astype(np.float32)
+
+
 def preprocess_image(image, means, stds):
     """Per-band z-score a single (C, H, W) frame; returns a float32 tensor."""
     means1 = means.reshape(-1, 1, 1)  # per-channel mean over H, W
@@ -202,7 +225,7 @@ class sm_dataset(NonGeoDataset):
 
     def __init__(self, rows, chips_root, merra_df,
                  means, stds, merra_means, merra_stds, sm_mean, sm_std,
-                 modality="both"):
+                 modality="both", hls_mode="chip"):
         # rows: a DataFrame of filtered master-CSV rows (has_HLS==1).
         # merra_df: per-split MERRA frame, MultiIndexed on (network, station),
         #           with a `time` column and all MERRA_COLS (LND+SLV merged).
@@ -217,9 +240,15 @@ class sm_dataset(NonGeoDataset):
         self.sm_std = np.asarray(sm_std)
         # Random tile selection uses the global numpy RNG (seeded by set_seed).
         assert modality in ("hls", "merra", "both"), f"bad modality {modality}"
+        assert hls_mode in ("chip", "pixel"), f"bad hls_mode {hls_mode}"
         self.modality = modality
+        self.hls_mode = hls_mode
         self.use_hls = modality in ("hls", "both")
         self.use_merra = modality in ("merra", "both")
+        # When HLS is on, hls_mode picks the spatial extent: the full 50x50 chip
+        # (chip -> Prithvi) or the single ISMN-location pixel (pixel -> MLP).
+        self.use_chip = self.use_hls and hls_mode == "chip"
+        self.use_pixel = self.use_hls and hls_mode == "pixel"
 
     def __len__(self):
         return len(self.rows)
@@ -239,8 +268,8 @@ class sm_dataset(NonGeoDataset):
         #       time (from the chip filename) to stay comparable with `both`.
         chip_path = resolve_chip(network, station, day, self.chips_root)
 
-        # --- HLS: read + per-band z-score (only when used) ---
-        if self.use_hls:
+        # --- HLS chip: read + per-band z-score (only when hls_mode=chip) ---
+        if self.use_chip:
             image, center_lonlat = load_raster(
                 chip_path, crop=(50, 50), return_center_lonlat=True
             )
@@ -248,7 +277,8 @@ class sm_dataset(NonGeoDataset):
             image = image.to(torch.float)
         else:
             # terratorch's PixelwiseRegressionTask hard-requires batch["image"];
-            # emit a tiny dummy placeholder that the merra-only model ignores.
+            # emit a tiny dummy placeholder. Both the merra-only model and the
+            # pixel-HLS model ignore it (pixel HLS rides in via "hls_pixel").
             image = torch.zeros(1, dtype=torch.float)
 
         # --- SM target: z-score (always) ---
@@ -260,6 +290,12 @@ class sm_dataset(NonGeoDataset):
             "mask": sm.to(torch.float),
             "filename": chip_path,
         }
+
+        # --- HLS pixel: 6 bands at the ISMN location, per-band z-score (only
+        if self.use_pixel:
+            pix = load_pixel(chip_path, float(row["longitude"]), float(row["latitude"]))
+            pix_norm = (pix - self.means) / self.stds
+            sample["hls_pixel"] = torch.from_numpy(pix_norm.astype(np.float32)).to(torch.float)
 
         # --- MERRA: vector nearest the HLS overpass time, per-variable z-score ---
         if self.use_merra:

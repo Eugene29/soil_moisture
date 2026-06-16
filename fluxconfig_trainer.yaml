@@ -37,6 +37,7 @@ T_HLS: 1          # int, number of HLS frames per window (single-frame SM uses 1
 T_MERRA: 1        # int, number of MERRA frames per window (single-frame SM uses 1)
 seed: 0
 modality: "both"   # one of: hls | merra | both -- which data source(s) to use
+hls_mode: "chip"   # one of: chip | pixel
 data:
   # Soil-moisture (SM) data. Normalization stats are computed at runtime from the
   # train split (see train.py: compute_sm_stats) and written to the run's output dir.

@@ -51,6 +51,8 @@ def apply_cli_overrides(cfg, args):
         cfg["seed"] = args.seed
     if args.modality is not None:
         cfg["modality"] = args.modality
+    if args.hls_mode is not None:
+        cfg["hls_mode"] = args.hls_mode
     return cfg
 
 
@@ -99,7 +101,7 @@ def dummy_sm_stats():
     )
 
 
-def compute_sm_stats(train_df, chips_root, merra_train, output_dir, modality):
+def compute_sm_stats(train_df, chips_root, merra_train, output_dir, modality, hls_mode):
     """Compute train-split-only normalization stats for the active modality.
 
     HLS stats are per-band over one resolved chip per train row (only when HLS is
@@ -113,10 +115,12 @@ def compute_sm_stats(train_df, chips_root, merra_train, output_dir, modality):
     # TODO: make the compute of stats modular and also look where you can add modularity for nicer code. 
     use_hls = modality in ("hls", "both")
     use_merra = modality in ("merra", "both")
+    use_pixel = use_hls and hls_mode == "pixel"
 
     # Resolve one chip per train row; its overpass time drives the MERRA lookup.
     chip_paths = []
     merra_rows = []
+    pixel_rows = []
     for _, row in train_df.iterrows():
         network, station = str(row["network"]), str(row["station"])
         day = datetime.fromisoformat(str(row["date"])).date()
@@ -126,8 +130,18 @@ def compute_sm_stats(train_df, chips_root, merra_train, output_dir, modality):
             merra_rows.append(
                 merra_vector(merra_train, network, station, overpass_datetime(chip))
             )
+        if use_pixel:
+            pixel_rows.append(
+                load_pixel(chip, float(row["longitude"]), float(row["latitude"]))
+            )
 
-    if use_hls:
+    if use_pixel:
+        # Pixel mode: per-band stats over the extracted ISMN-location pixels, so
+        # normalization matches exactly what the pixel model sees.
+        pixel_rows = np.stack(pixel_rows)
+        means = pixel_rows.mean(axis=0).astype(np.float32)
+        stds = pixel_rows.std(axis=0, ddof=1).astype(np.float32)
+    elif use_hls:
         # chips_dir="" so hls_stats uses the absolute paths as-is.
         means, stds = hls_stats(chip_paths, chips_dir="")
     else:
@@ -148,6 +162,7 @@ def compute_sm_stats(train_df, chips_root, merra_train, output_dir, modality):
     stats = {
         "provenance": {
             "modality": modality,
+            "hls_mode": hls_mode,
             "n_train_rows": int(len(train_df)),
             "n_train_stations": int(train_df.groupby(["network", "station"]).ngroups),
             "merra_cols": MERRA_COLS,
@@ -174,6 +189,7 @@ def build_data(cfg, output_dir):
     chips_root = cfg_data["chips_root"]
     merra_root = cfg_data["merra_root"]
     modality = cfg["modality"]
+    hls_mode = cfg.get("hls_mode", "chip")
     use_merra = modality in ("merra", "both")
 
     df = pd.read_csv(cfg_data["master_csv"])
@@ -201,18 +217,18 @@ def build_data(cfg, output_dir):
         means, stds, merra_means, merra_stds, sm_mean, sm_std = dummy_sm_stats()
     else:
         means, stds, merra_means, merra_stds, sm_mean, sm_std = compute_sm_stats(
-            train_df, chips_root, merra_train, output_dir, modality
+            train_df, chips_root, merra_train, output_dir, modality, hls_mode
         )
 
     sm_dataset_train = sm_dataset(
         train_df, chips_root, merra_train,
         means, stds, merra_means, merra_stds, sm_mean, sm_std,
-        modality=modality,
+        modality=modality, hls_mode=hls_mode,
     )
     sm_dataset_test = sm_dataset(
         test_df, chips_root, merra_test,
         means, stds, merra_means, merra_stds, sm_mean, sm_std,
-        modality=modality,
+        modality=modality, hls_mode=hls_mode,
     )
 
     datamodule = sm_dataloader(
@@ -244,12 +260,15 @@ def build_model(cfg, wt_file, use_TL_encoding):
     T_HLS = cfg["T_HLS"]
     T_MERRA = cfg["T_MERRA"]
     modality = cfg["modality"]
+    hls_mode = cfg.get("hls_mode", "chip")
     use_hls = modality in ("hls", "both")
+    # Prithvi is only built for full-chip HLS; pixel-HLS uses a small MLP instead.
+    use_chip = use_hls and hls_mode == "chip"
 
     prithvi_model = None
     # Encoder emits (patches_per_frame * T_HLS + 1) tokens; padded 50x50 / patch 16 -> 3x3 = 9 patches/frame.
     n_tokens = 9 * T_HLS + 1
-    if use_hls:
+    if use_chip:
         coords_encoding = ["time", "location"] if use_TL_encoding else []
 
         prithvi_instance = PrithviViT(
@@ -274,7 +293,8 @@ def build_model(cfg, wt_file, use_TL_encoding):
         prithvi_model.freeze_encoder()
 
     model_comb = RegressionModelSM(
-        prithvi_model, n_tokens=n_tokens, T_MERRA=T_MERRA, modality=modality
+        prithvi_model, n_tokens=n_tokens, T_MERRA=T_MERRA, modality=modality,
+        hls_mode=hls_mode,
     )
     task = PixelwiseRegressionTask(
         None, None, model=model_comb, loss="mse",
@@ -289,8 +309,8 @@ def build_trainer(cfg, task, output_dir, model_name, ts):
     """Construct the Lightning Trainer with the run's callbacks and logger."""
     print("building a trainer...")
     run_name = (
-        f"{model_name}_{cfg['modality']}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}"
-        f"_{ts}"
+        f"{model_name}_{cfg['modality']}_{cfg.get('hls_mode', 'chip')}"
+        f"_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}_{ts}"
     )
     wandb_logger = WandbLogger(
         project="soil_moisture",
@@ -414,6 +434,7 @@ def main():
     parser.add_argument("--t-merra", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--modality", choices=["hls", "merra", "both"], default=None)
+    parser.add_argument("--hls-mode", choices=["chip", "pixel"], default=None)
     parser.add_argument("--tl-encoding", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -432,19 +453,20 @@ def main():
     cfg = apply_cli_overrides(cfg, args)
     cfg["debug"] = args.debug
     modality = cfg["modality"]
+    hls_mode = cfg.get("hls_mode", "chip")
 
     output_root = Path("outputs")
     output_root.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = (
-        output_root / model_name / modality
+        output_root / model_name / modality / hls_mode
         / f"thls_{cfg['T_HLS']}_tmerra_{cfg['T_MERRA']}" / ts
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     save_resolved_config(cfg, run_dir)
 
     print(
-        f"\n=== {model_name} | modality {modality} "
+        f"\n=== {model_name} | modality {modality} | hls_mode {hls_mode} "
         f"| T_HLS {cfg['T_HLS']} | T_MERRA {cfg['T_MERRA']} | seed {cfg['seed']} ==="
     )
     metrics = run(
@@ -460,9 +482,9 @@ def main():
     tl_tag = "_tl" if args.tl_encoding else ""
     summary_path = (
         output_root
-        / f"summary_{modality}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}_seed{cfg['seed']}{tl_tag}.csv"
+        / f"summary_{modality}_{hls_mode}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}_seed{cfg['seed']}{tl_tag}.csv"
     )
-    pd.DataFrame([{"model": model_name, "modality": modality, **metrics}]).to_csv(
+    pd.DataFrame([{"model": model_name, "modality": modality, "hls_mode": hls_mode, **metrics}]).to_csv(
         summary_path, index=False
     )
     print(f"Run output dir at {run_dir.absolute()}")
