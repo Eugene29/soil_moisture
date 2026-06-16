@@ -17,15 +17,18 @@ training:
   shuffle: True
   optimizer:
     name: "AdamW"
+    # lr: 1.0e-3
+    lr: 5.0e-5
     params:
-      lr: 5e-5
-  scheduler:
+      # weight_decay: 1.0
+      weight_decay: 1.0e-4
+  scheduler:           # not used by train.py yet
     use: 1
     name: "ReduceLROnPlateau"
-  dropout:
+  dropout:             # not used by train.py yet (see model.head_dropout instead)
     use: 1
     val: 0.2
-  bn: 1
+  bn: 1                # not used by train.py yet
 testing:
   test_batch_size: 16
   shuffle: True

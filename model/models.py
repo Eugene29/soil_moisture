@@ -290,26 +290,18 @@ class prithvi_terratorch(nn.Module):
         self,
         prithvi_weight,
         model_instance,
-        manually_parse_weights=True,
         use_TL_encoding=False,
     ):
-
         super(prithvi_terratorch, self).__init__()
-
-        # load checkpoint for Prithvi_global
-
         self.weights_path = prithvi_weight
-        self.checkpoint = torch.load(self.weights_path)
         self.use_TL_encoding = use_TL_encoding
-
         self.prithvi_model = model_instance
 
-        if manually_parse_weights:
-            parsed_checkpoint = self.parse_weight(self.checkpoint)
-            # NOTE: strict = False because pos_embed should be constructed on the fly and not throw an error when loading it.
+        if prithvi_weight is not None:
+            checkpoint = torch.load(self.weights_path)
+            parsed_checkpoint = self.parse_weight(checkpoint)
+            # NOTE: Need strict = False because pos_embed depends on data input size. 
             self.prithvi_model.load_state_dict(parsed_checkpoint, strict=False)
-        else:
-            self.prithvi_model.load_state_dict(self.checkpoint, strict=False)
 
     def parse_weight(self, checkpoint: str):
         parsed_weight = {}

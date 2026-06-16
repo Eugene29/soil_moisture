@@ -233,7 +233,7 @@ def build_data(cfg, output_dir):
     )
 
 
-def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
+def build_model(cfg, wt_file, use_TL_encoding):
     """Assemble the active-modality model into a Lightning task.
 
     The frozen Prithvi encoder is built only when HLS is used; merra-only skips
@@ -269,7 +269,6 @@ def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
         prithvi_model = prithvi_terratorch(
             wt_file,
             prithvi_instance,
-            manually_parse_weights=manually_parse_weights,
             use_TL_encoding=use_TL_encoding,
         )
         prithvi_model.freeze_encoder()
@@ -278,7 +277,10 @@ def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
         prithvi_model, n_tokens=n_tokens, T_MERRA=T_MERRA, modality=modality
     )
     task = PixelwiseRegressionTask(
-        None, None, model=model_comb, loss="mse", optimizer="AdamW"
+        None, None, model=model_comb, loss="mse",
+        optimizer=cfg["training"]["optimizer"]["name"],
+        lr=cfg["training"]["optimizer"]["lr"],
+        optimizer_hparams=cfg["training"]["optimizer"]["params"],
     )
     return task
 
@@ -286,9 +288,6 @@ def build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights):
 def build_trainer(cfg, task, output_dir, model_name, ts):
     """Construct the Lightning Trainer with the run's callbacks and logger."""
     print("building a trainer...")
-    checkpoint_callback = ModelCheckpoint(
-        monitor=task.monitor, save_top_k=1, save_last=True
-    )
     run_name = (
         f"{model_name}_{cfg['modality']}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}"
         f"_{ts}"
@@ -305,7 +304,6 @@ def build_trainer(cfg, task, output_dir, model_name, ts):
         accelerator="cuda",
         callbacks=[
             RichProgressBar(),
-            checkpoint_callback,
             LearningRateMonitor(logging_interval="epoch"),
         ],
         max_epochs=cfg["n_iteration"],
@@ -313,6 +311,7 @@ def build_trainer(cfg, task, output_dir, model_name, ts):
         log_every_n_steps=1,
         check_val_every_n_epoch=1,
         logger=wandb_logger,
+        enable_checkpointing=False,
     )
     return trainer, wandb_logger
 
@@ -338,7 +337,7 @@ def evaluate_split(
 
 def save_metrics(zs, test, train, cfg, output_dir):
     """Collect per-split scores into one metrics dict and write it as JSON."""
-    learning_rate = float(cfg["training"]["optimizer"]["params"]["lr"])
+    learning_rate = float(cfg["training"]["optimizer"]["lr"])
     metrics = {
         "zeroshot_r2_norm": zs["r2_norm"],
         "zeroshot_r2_unnorm": zs["r2_unnorm"],
@@ -375,7 +374,6 @@ def run(
     wt_file,
     use_TL_encoding,
     output_dir,
-    manually_parse_weights,
     cfg,
     ts,
 ):
@@ -384,7 +382,7 @@ def run(
     (datamodule, datamodule_train, sm_dataset_train, sm_dataset_test,
      sm_mean, sm_std) = build_data(cfg, output_dir)
 
-    task = build_model(cfg, wt_file, use_TL_encoding, manually_parse_weights)
+    task = build_model(cfg, wt_file, use_TL_encoding)
     trainer, wandb_logger = build_trainer(cfg, task, output_dir, model_name, ts)
 
     # zeroshot eval -> fit -> post-training eval on the test and train splits.
@@ -428,7 +426,6 @@ def main():
     # TODO: add flags to change model variation.
     config_fname = "fluxconfig_trainer.yaml"
     wt_file = "/home/yjean234/Azad/Prithvi-EO-2.0/examples/carbon_flux/Prithvi_EO_V2_300M_TL.pt"
-    manually_parse_weights = True
     model_name = "Prithvi-EO-2.0-300M-TL" if args.tl_encoding else "Prithvi-EO-2.0-300M"
 
     cfg = read_and_save_config(config_fname)
@@ -455,7 +452,6 @@ def main():
         wt_file=wt_file,
         use_TL_encoding=args.tl_encoding,
         output_dir=run_dir,
-        manually_parse_weights=manually_parse_weights,
         cfg=cfg,
         ts=ts,
     )
