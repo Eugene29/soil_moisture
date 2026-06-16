@@ -17,8 +17,8 @@ training:
   shuffle: True
   optimizer:
     name: "AdamW"
-    # lr: 1.0e-3
-    lr: 5.0e-5
+    lr: 1.0e-3
+    # lr: 5.0e-5
     params:
       # weight_decay: 1.0
       weight_decay: 1.0e-4

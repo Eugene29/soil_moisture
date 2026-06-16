@@ -166,20 +166,11 @@ def preprocess_image(image, means, stds):
     return torch.from_numpy(normalized).to(torch.float32)
 
 
-# ---------------------------------------------------------------------------
-# Spatial split (leakage-safe). Signature + TODO only for now.
-# ---------------------------------------------------------------------------
 def spatial_split(df, test_fraction=0.2):
     """Split master-CSV rows into (train_df, test_df) BY STATION.
 
     Splitting by station (not by row) keeps the split leakage-safe: a station's
     rows fall entirely on one side, so no station appears in both train and test.
-
-    Stations are shuffled with a seeded RNG; the last `test_fraction` of them
-    form the test set.
-
-    TODO: replace this simple random-by-station split with the real spatial /
-          regional split (e.g. hold out a contiguous geographic region).
     """
     pairs = (
         df[["network", "station"]]
