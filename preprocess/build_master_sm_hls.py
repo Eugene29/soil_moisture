@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Build a TX + 2020 subset of the daily surface SM table, flagged with has_HLS.
+"""Build a TX + 2015-2025 subset of the daily surface SM table, flagged with has_HLS.
 
 Output keeps ONLY rows that are both (a) a Texas station listed in
-hls_stations_tx.csv and (b) dated in 2020. Each kept row gets a has_HLS column:
-1 if at least one HLS .tif exists for that station on that calendar date, else 0.
-MERRA2 is intentionally ignored (it exists every day).
+hls_stations_tx.csv and (b) dated within [YEAR_MIN, YEAR_MAX]. Each kept row gets
+a has_HLS column: 1 if at least one HLS .tif exists for that station on that
+calendar date, else 0. MERRA2 is intentionally ignored (it exists every day).
 
 Performance: HLS coverage is reduced once to a small in-memory set of
 (network, station, date) keys parsed from filenames. The 3M-row SM CSV is
-streamed in chunks, filtered to 2020 + TX stations first (which drops the vast
-majority of rows), then flagged with a vectorized O(1) set lookup.
+streamed in chunks, filtered to the year range + TX stations first (which drops
+the vast majority of rows), then flagged with a vectorized O(1) set lookup.
 """
 
 import os
@@ -19,13 +19,16 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-DATA = "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data"
-SM_CSV = f"{DATA}/raw_sm_daily_surface.csv"
-HLS_ROOT = f"{DATA}/HLS/tx_ismn_2020"
+DATA = "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture"
+# SM tables (raw + the master output) live under ISMN/; HLS chips + station list
+# live under HLS/.
+SM_CSV = f"{DATA}/ISMN/raw_sm_daily_surface.csv"
+HLS_ROOT = f"{DATA}/HLS/tx_ismn_2015_2025"
 TX_STATIONS_CSV = f"{DATA}/HLS/hls_stations_tx.csv"
-OUT_CSV = f"{DATA}/master_sm_hls_tx_2020.csv"
+OUT_CSV = f"{DATA}/ISMN/master_sm_hls_tx_2015_2025.csv"
 
-YEAR = 2020
+YEAR_MIN = 2015
+YEAR_MAX = 2025
 CHUNKSIZE = 500_000
 
 # HLS filename token, e.g. HLS.S30.T14RQU.2020032T170659.v2.0.merged.subset.tif
@@ -83,8 +86,10 @@ def main() -> None:
     total_hls = 0
     for chunk in pd.read_csv(SM_CSV, chunksize=CHUNKSIZE,
                              dtype={"network": str, "station": str}):
-        # Filter to year 2020 first (cheap, drops most rows).
-        chunk = chunk[chunk["date"].astype(str).str.startswith(f"{YEAR}-")]
+        # Filter to the year range first (cheap, drops most rows). Dates are
+        # ISO 'YYYY-MM-DD', so the 4-char year prefix compares lexically as int.
+        year = chunk["date"].astype(str).str.slice(0, 4)
+        chunk = chunk[(year >= str(YEAR_MIN)) & (year <= str(YEAR_MAX))]
         if chunk.empty:
             continue
 
@@ -105,7 +110,7 @@ def main() -> None:
         total_hls += int(flag.sum())
 
     if first:
-        print("WARNING: no rows matched TX stations + 2020. No output written.")
+        print("WARNING: no rows matched TX stations + year range. No output written.")
         return
 
     print(f"Wrote {total_out} rows -> {OUT_CSV}")

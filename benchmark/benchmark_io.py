@@ -9,7 +9,7 @@ img = src.read()
 dur = time.time() - strt
 
 strt = time.time()
-fname = "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/HLS/tx_ismn_2020/COSMOS_Bushland/HLS.S30.T13SGV.2020286T173259.v2.0.merged.subset.tif"
+fname = "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/HLS/tx_ismn_2020/COSMOS_Bushland/HLS.S30.T13SGV.2020286T173259.v2.0.merged.subset.tif"
 src = rasterio.open(fname)
 img = src.read()
 dur = time.time() - strt
