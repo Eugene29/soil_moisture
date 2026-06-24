@@ -1,0 +1,10 @@
+# These parameters are used for prithvi.
+# TODO: make models modular and composable. 
+name: "Base_Flux"
+n_channel: 6
+embed_dim: 1024
+patch_size: [1, 16, 16]
+num_heads: 16
+mlp_ratio: 4
+depth: 24
+head_dropout: 0.2

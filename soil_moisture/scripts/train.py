@@ -1,24 +1,15 @@
-import argparse
 import glob
-import itertools
 import json
 import os
-import pickle
-import random
 import warnings
 from datetime import datetime
-from functools import partial
 from pathlib import Path
-from typing import NamedTuple, Optional
 
-import matplotlib.pyplot as plt
+import hydra
 import numpy as np
 import pandas as pd
-import rasterio
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import yaml
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import (
     EarlyStopping,
@@ -36,21 +27,6 @@ from soil_moisture.data.data_loader import (
     MERRA_COLS, MERRA_LND_COLS, MERRA_SLV_COLS, merra_vector,
     overpass_datetime, resolve_chip, sm_dataloader, sm_dataset, spatial_split
 )
-
-
-def apply_cli_overrides(cfg, args):
-    """Override config values only for CLI args that were actually passed.
-    # TODO: override with hydra for cleaner code
-    """
-    if args.t_hls is not None:
-        cfg["T_HLS"] = args.t_hls
-    if args.t_merra is not None:
-        cfg["T_MERRA"] = args.t_merra
-    if args.seed is not None:
-        cfg["seed"] = args.seed
-    if args.modality is not None:
-        cfg["modality"] = args.modality
-    return cfg
 
 
 def load_merra_frame(stations, merra_root):
@@ -297,7 +273,10 @@ def build_trainer(cfg, task, output_dir, model_name, ts):
         log_model=False,
         save_dir=str(output_dir),
     )
-    wandb_logger.experiment.config.update(cfg) 
+
+    wandb_logger.experiment.config.update(
+        OmegaConf.to_container(cfg, resolve=True)
+    )
 
     trainer = Trainer(
         accelerator="cuda",
@@ -355,19 +334,6 @@ def save_metrics(zs, test, train, cfg, output_dir):
         json.dump(metrics, f, indent=2)
     return metrics
 
-def read_and_save_config(cfg_fname):
-    """Read model configs from YAML"""
-    with open(cfg_fname, "r") as file:
-        cfg = yaml.safe_load(file)
-    return cfg
-
-
-def save_resolved_config(cfg, output_dir):
-    """Snapshot the resolved config (post-override) as plain YAML."""
-    with open(output_dir / "config.yaml", "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
-
-
 def run(
     model_name,
     wt_file,
@@ -406,66 +372,41 @@ def run(
     return metrics
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dev", default="1")
-    parser.add_argument("--t-hls", type=int, default=None)
-    parser.add_argument("--t-merra", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--modality", choices=["hls", "merra", "both"], default=None)
-    parser.add_argument("--tl-encoding", action="store_true")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--config", default="configs/fluxconfig_2015_2025.yaml")
-    args = parser.parse_args()
-
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="config")
+def main(cfg: DictConfig):
     warnings.filterwarnings("ignore")
     # only use one gpu for now as I'm seeing distributed sampling issue.
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.dev
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.dev)
 
     # TODO: add flags to change model variation.
-    config_fname = args.config
-    wt_file = "/home/yjean234/Azad/Prithvi-EO-2.0/examples/carbon_flux/Prithvi_EO_V2_300M_TL.pt"
-    model_name = "Prithvi-EO-2.0-300M-TL" if args.tl_encoding else "Prithvi-EO-2.0-300M"
-
-    cfg = read_and_save_config(config_fname)
-    cfg = apply_cli_overrides(cfg, args)
-    cfg["debug"] = args.debug
-    modality = cfg["modality"]
-
-    output_root = Path("outputs")
-    output_root.mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = (
-        output_root / model_name / modality
-        / f"thls_{cfg['T_HLS']}_tmerra_{cfg['T_MERRA']}" / ts
+    wt_file = cfg.wt_file
+    model_name = (
+        "Prithvi-EO-2.0-300M-TL" if cfg.tl_encoding else "Prithvi-EO-2.0-300M"
     )
-    run_dir.mkdir(parents=True, exist_ok=True)
-    save_resolved_config(cfg, run_dir)
+    modality = cfg.modality
+
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    ts = run_dir.name  # the timestamp folder; used in the wandb run name.
 
     print(
         f"\n=== {model_name} | modality {modality} "
-        f"| T_HLS {cfg['T_HLS']} | T_MERRA {cfg['T_MERRA']} | seed {cfg['seed']} ==="
+        f"| T_HLS {cfg.T_HLS} | T_MERRA {cfg.T_MERRA} | seed {cfg.seed} ==="
     )
     metrics = run(
         model_name=model_name,
         wt_file=wt_file,
-        use_TL_encoding=args.tl_encoding,
+        use_TL_encoding=cfg.tl_encoding,
         output_dir=run_dir,
         cfg=cfg,
         ts=ts,
     )
 
-    # Per-process summary so parallel launches don't clobber each other.
-    tl_tag = "_tl" if args.tl_encoding else ""
-    summary_path = (
-        output_root
-        / f"summary_{modality}_thls{cfg['T_HLS']}_tmerra{cfg['T_MERRA']}_seed{cfg['seed']}{tl_tag}.csv"
-    )
+    # Per-run summary, written into this run's dir so parallel launches never
+    # clobber each other.
     pd.DataFrame([{"model": model_name, "modality": modality, **metrics}]).to_csv(
-        summary_path, index=False
+        run_dir / "summary.csv", index=False
     )
     print(f"Run output dir at {run_dir.absolute()}")
-    print(f"Wrote summary to {summary_path}")
 
 
 if __name__ == "__main__":

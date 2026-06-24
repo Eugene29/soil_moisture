@@ -1,0 +1,5 @@
+master_csv: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/ISMN/azads/master_sm_hls_tx_2015_2025.csv"
+chips_root: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/HLS/tx_ismn_2015_2025"
+merra_root: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/MERRA2/merra2_tx_2015_2025"
+test_fraction: 0.2
+input_size: [6, 50, 50]

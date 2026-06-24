@@ -1,0 +1,18 @@
+train_batch_size: 16
+shuffle: true
+
+optimizer:
+  name: "AdamW"
+  lr: 1.0e-3
+  params:
+    weight_decay: 1.0e-4
+
+scheduler:           # not used by train.py yet
+  use: 1
+  name: "ReduceLROnPlateau"
+
+dropout:             # not used by train.py yet
+  use: 1
+  val: 0.2
+
+bn: 1                # not used by train.py yet

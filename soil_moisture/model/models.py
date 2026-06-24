@@ -50,6 +50,7 @@ class PatchEmbed(nn.Module):
             x = x.flatten(2).transpose(1, 2)  # B,C,T,H,W -> B,C,L -> B,L,C
         x = self.norm(x)
         return x
+        
 class PrithviViT(nn.Module):
     """ Prithvi ViT Encoder"""
     def __init__(self,

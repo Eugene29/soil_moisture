@@ -1,0 +1,2 @@
+test_batch_size: 16
+shuffle: true

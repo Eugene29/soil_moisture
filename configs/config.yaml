@@ -1,0 +1,30 @@
+defaults:
+  - model: default
+  - training: default
+  - testing: default
+  - data: tx_2020
+  - _self_
+
+device_name: "cuda"
+n_iteration: 50
+seed: 0
+normalization: "z-score-std"
+modality: "both"   # hls | merra | both
+
+# TODO: add back when implementing temporal memory
+T_HLS: 1
+T_MERRA: 1
+
+# Run/encoder options previously passed as CLI flags.
+tl_encoding: false
+debug: false
+dev: "1"            # CUDA_VISIBLE_DEVICES
+
+wt_file: "/home/yjean234/Azad/Prithvi-EO-2.0/examples/carbon_flux/Prithvi_EO_V2_300M_TL.pt"
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  sweep:
+    dir: outputs/${now:%Y-%m-%d}
+    subdir: ${now:%H-%M-%S-%f}_${hydra.job.num}
