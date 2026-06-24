@@ -27,29 +27,19 @@ from lightning.pytorch.callbacks import (
     RichProgressBar,
 )
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
-from terratorch.models.backbones.prithvi_mae import PrithviViT
 from terratorch.tasks import PixelwiseRegressionTask
 
-# train.py lives in scripts/; the project packages (model, data_loader,
-# preprocess) and the configs/ and outputs/ dirs live in the project root one
-# level up. Put the root on sys.path so those imports resolve, and run from the
-# root so the relative configs/ and outputs/ paths still work.
-import sys
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from utils import *
-from model.models import *
-from data_loader.data_loader import *
-from preprocess.compute_data_stats import hls_stats, col_stats
+from soil_moisture.scripts.utils import set_seed, save_scatter, predict_and_score
+from soil_moisture.model.models import prithvi_terratorch, RegressionModelSM, PrithviViT
+from soil_moisture.data.compute_data_stats import hls_stats, col_stats
+from soil_moisture.data.data_loader import (
+    MERRA_COLS, MERRA_LND_COLS, MERRA_SLV_COLS, merra_vector,
+    overpass_datetime, resolve_chip, sm_dataloader, sm_dataset, spatial_split
+)
 
 
 def apply_cli_overrides(cfg, args):
     """Override config values only for CLI args that were actually passed.
-
-    The YAML holds the real defaults; each override-able arg defaults to None in
-    argparse, so None means "not passed -- keep the config value".
     # TODO: override with hydra for cleaner code
     """
     if args.t_hls is not None:
@@ -429,7 +419,6 @@ def main():
     args = parser.parse_args()
 
     warnings.filterwarnings("ignore")
-    os.chdir(PROJECT_ROOT)
     # only use one gpu for now as I'm seeing distributed sampling issue.
     os.environ["CUDA_VISIBLE_DEVICES"] = args.dev
 

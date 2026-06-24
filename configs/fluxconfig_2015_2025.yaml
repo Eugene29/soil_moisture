@@ -40,7 +40,7 @@ modality: "both"   # one of: hls | merra | both -- which data source(s) to use
 data:
   # Soil-moisture (SM) data. Normalization stats are computed at runtime from the
   # train split (see train.py: compute_sm_stats) and written to the run's output dir.
-  master_csv: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/ISMN/master_sm_hls_tx_2015_2025.csv"
+  master_csv: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/ISMN/azads/master_sm_hls_tx_2015_2025.csv"
   chips_root: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/HLS/tx_ismn_2015_2025"
   merra_root: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/MERRA2/merra2_tx_2015_2025"
   test_fraction: 0.2

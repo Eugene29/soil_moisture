@@ -42,7 +42,7 @@ data:
   # train split (see train.py: compute_sm_stats) and written to the run's output dir.
   # 2020-only experiment. The 2020 chips live inside the combined chips_root; the
   # 2020 master CSV restricts loading to 2020 rows.
-  master_csv: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/ISMN/master_sm_hls_tx_2020.csv"
+  master_csv: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/ISMN/azads/master_sm_hls_tx_2020.csv"
   chips_root: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/HLS/tx_ismn_2015_2025"
   merra_root: "/net/arch-lauprs2.arch.tamu.edu/tank/mercury/eku/data/soil-moisture/MERRA2/merra2_tx_2020"
   test_fraction: 0.2
