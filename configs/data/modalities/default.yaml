@@ -1,0 +1,13 @@
+hls:
+  _target_: soil_moisture.data.modalities.HLS.HLSModality
+  _partial_: true
+  chips_root: ${data.chips_root}
+merra:
+  _target_: soil_moisture.data.modalities.MERRA2.MERRA2Modality
+  _partial_: true
+  chips_root: ${data.chips_root}
+  merra_root: ${data.merra_root}
+# smap:
+#   _target_: soil_moisture.data.modalities.SMAP.SMAPModality
+#   _partial_: true
+#   smap_root: ${data.smap_root}

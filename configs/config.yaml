@@ -9,7 +9,7 @@ device_name: "cuda"
 n_iteration: 50
 seed: 0
 normalization: "z-score-std"
-modality: "both"   # hls | merra | both
+modalities: [hls, merra]
 
 # TODO: add back when implementing temporal memory
 T_HLS: 1

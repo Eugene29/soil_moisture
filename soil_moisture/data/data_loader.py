@@ -1,196 +1,16 @@
-"""Data loading for the soil-moisture (SM) downstream task.
 
-Inputs are resolved ON THE FLY from the master SM table
-(`master_sm_hls_tx_2020.csv`, columns: network, station, longitude, latitude,
-depth_from, depth_to, date, soil_moisture, has_HLS). For each row the loader:
-
-  1. resolves the HLS chip by globbing the station folder and matching the row's
-     calendar date to the filename's day-of-year token, picking ONE at random
-     when several tiles/sensors cover the same (station, date); and
-  2. reads that date's MERRA values from the per-station hourly LND/SLV CSVs,
-     reducing hourly -> daily.
-
-Normalization uses train-split-only stats passed in by the caller (see
-`preprocess/compute_data_stats.py`); the SAME stats are applied to train and
-test so the held-out split never leaks into normalization.
-
-Two codepaths live here:
-  * `sm_dataset`  -- the active, single-frame path (one chip -> one SM value).
-  * `flux_dataset` + `build_windows` -- the dormant temporal (T_HLS/T_MERRA)
-    machinery, kept for later development. It is gated behind an assert and is
-    NOT exercised by the current task.
-"""
-
-import os
-import re
-import glob
-from datetime import date, datetime, timedelta
+from datetime import date
 
 from lightning import LightningModule
 import numpy as np
-import pandas as pd
 import torch
 from torchgeo.datasets import NonGeoDataset
-import rasterio
-
-from rasterio.warp import transform as warp_transform
 from torch.utils.data import DataLoader
 
-
-NO_DATA_FLOAT = 0.0001
-
-# --- MERRA variable set for the SM task ------------------------------------
-# Chosen as physically relevant to surface soil moisture. The hourly MERRA2
-# data is split across two products: LND (land surface) and SLV (single level).
-# TODO: revisit MERRA variable selection AND the hourly->daily reduction
-#       (currently daily-mean for all; precip-as-sum and T2MIN/MAX may be added).
-MERRA_LND_COLS = [
-    "PRECTOTLAND",  # total precipitation over land -- primary SM driver
-    "GWETTOP",      # surface soil wetness -- closest proxy to the target
-    "GWETROOT",     # root-zone soil wetness
-    "SFMC",         # surface soil moisture content
-    "RZMC",         # root-zone soil moisture content
-    "EVLAND",       # evaporation over land -- moisture loss
-    "LHLAND",       # latent heat flux -- couples to ET / drying
-    "RUNOFF",       # runoff -- water leaving the column
-]
-MERRA_SLV_COLS = [
-    "T2M",          # 2m air temperature -- evaporative demand
-    "T2MDEW",       # 2m dewpoint -- humidity / drying potential
-]
-MERRA_COLS = MERRA_LND_COLS + MERRA_SLV_COLS  # fixed output order, len == 10
-
-# HLS filename date token, e.g. HLS.S30.T14RQU.2020032T170659.v2.0.merged.subset.tif
-#                                              ^^^^ ^^^  = YYYY DDD (day-of-year)
-_HLS_DATE_TOKEN = re.compile(r"\.(\d{4})(\d{3})T\d{6}\.")
-
-
-def doy_to_date(year: int, doy: int) -> date:
-    """Convert a (year, day-of-year) pair to a calendar date (2020 is a leap year)."""
-    return date(year, 1, 1) + timedelta(days=doy - 1)
-
-
-# ---------------------------------------------------------------------------
-# On-the-fly resolution helpers
-# ---------------------------------------------------------------------------
-def resolve_chip(network, station, day, chips_root):
-    """Find one HLS merged-chip path for a (station, date) on the fly.
-
-    Globs `<chips_root>/<network>_<station>/*.merged.subset.tif`, keeps files
-    whose day-of-year token maps to `day` (a `datetime.date`). Since a
-    station/date can be covered by several tiles or sensors (S30/L30) -- picks
-    ONE at random via `rng`. Random selection happens per access, so over many
-    epochs the model sees the different valid tiles (a mild augmentation).
-
-    Raises if no merged chip matches (callers should only pass has_HLS==1 rows).
-    """
-    folder = os.path.join(chips_root, f"{network}_{station}")
-    matches = []
-    for path in glob.glob(os.path.join(folder, "*.merged.subset.tif")):
-        m = _HLS_DATE_TOKEN.search(os.path.basename(path))
-        if not m:
-            continue
-        if doy_to_date(int(m.group(1)), int(m.group(2))) == day:
-            matches.append(path)
-    if not matches:
-        raise FileNotFoundError(
-            f"No merged HLS chip for {network}_{station} on {day} in {folder}"
-        )
-    return matches[np.random.randint(len(matches))]
-
-
-def overpass_datetime(chip_path):
-    """Parse the HLS acquisition datetime (UTC) from a chip filename.
-
-    Filename token is `.<YYYY><DDD>T<HHMMSS>.`, e.g. 2020012T172032 -> 2020-01-12
-    17:20:32. Returns a `datetime.datetime`.
-    """
-    name = os.path.basename(chip_path)
-    m = re.search(r"\.(\d{4})(\d{3})T(\d{2})(\d{2})(\d{2})\.", name)
-    if not m:
-        raise ValueError(f"No HLS date/time token in {chip_path}")
-    d = doy_to_date(int(m.group(1)), int(m.group(2)))
-    return datetime(d.year, d.month, d.day,
-                    int(m.group(3)), int(m.group(4)), int(m.group(5)))
-
-
-def merra_vector(merra_df, network, station, when):
-    """MERRA feature vector for the row nearest the HLS overpass time `when`.
-
-    `merra_df` is a per-split frame MultiIndexed on (network, station), with a
-    `time` column (datetime) and all MERRA_COLS columns (LND+SLV already merged
-    on time). Returns a float32 array of shape (len(MERRA_COLS),) for the single
-    hourly row closest to `when` (a datetime) for that station.
-
-    TODO: verify the MERRA `time` column is UTC (HLS overpass times are UTC). A
-          timezone mismatch would shift the selected hour.
-    """
-    station_rows = merra_df.loc[(network, station)]
-    pos = (station_rows["time"] - pd.Timestamp(when)).abs().to_numpy().argmin()
-    return station_rows[MERRA_COLS].to_numpy(dtype=np.float32)[pos]
-
-
-def load_raster(path, crop=None, return_center_lonlat=False):
-
-        with rasterio.open(path) as src:
-            img = src.read()
-
-            # load selected 6 bands (HLS surface reflectance)
-            img = img[0:6, :, :]
-
-            # Remap the NO_DATA sentinel and NaN gaps (some SM chips have NaN
-            # pixels) to NO_DATA_FLOAT so they don't propagate through z-scoring.
-            img = np.where(np.isnan(img), NO_DATA_FLOAT, img)
-
-            if crop:
-                img = img[:, -crop[0]:, -crop[1]:]
-
-            center_lonlat = None
-            if return_center_lonlat:
-                # Compute chip-center coords in the file's CRS, then reproject to EPSG:4326.
-                h, w = src.height, src.width
-                cx, cy = src.transform * (w / 2.0, h / 2.0)
-                lon, lat = warp_transform(src.crs, "EPSG:4326", [cx], [cy])
-                center_lonlat = (float(lon[0]), float(lat[0]))
-
-        if return_center_lonlat:
-            return img, center_lonlat
-        return img
-
-
-def preprocess_image(image, means, stds):
-    """Per-band z-score a single (C, H, W) frame; returns a float32 tensor."""
-    means1 = means.reshape(-1, 1, 1)  # per-channel mean over H, W
-    stds1 = stds.reshape(-1, 1, 1)    # per-channel std over H, W
-    normalized = (image - means1) / stds1
-    return torch.from_numpy(normalized).to(torch.float32)
-
-
-def spatial_split(df, test_fraction=0.2):
-    """Split master-CSV rows into (train_df, test_df) BY STATION.
-
-    Splitting by station (not by row) keeps the split leakage-safe: a station's
-    rows fall entirely on one side, so no station appears in both train and test.
-    """
-    pairs = (
-        df[["network", "station"]]
-        .drop_duplicates()
-        .sort_values(["network", "station"])
-        .itertuples(index=False, name=None)
-    )
-    pairs = [(str(n), str(s)) for n, s in pairs]
-
-    n_test = max(1, int(round(len(pairs) * test_fraction)))
-    test_pairs = set(pairs[:n_test])
-
-    in_test = np.array(
-        [(str(n), str(s)) in test_pairs
-         for n, s in zip(df["network"], df["station"])]
-    )
-    test_df = df[in_test].reset_index(drop=True)
-    train_df = df[~in_test].reset_index(drop=True)
-    return train_df, test_df
-
+from soil_moisture.data.data_utils import (
+    doy_to_date,
+    resolve_chip,
+)
 
 class sm_dataset(NonGeoDataset):
     """Single-frame soil-moisture dataset.
@@ -200,74 +20,40 @@ class sm_dataset(NonGeoDataset):
     passed in; the same stats normalize train and test.
     """
 
-    def __init__(self, rows, chips_root, merra_df,
-                 means, stds, merra_means, merra_stds, sm_mean, sm_std,
-                 modality="both"):
+    def __init__(self, df, modalities, sm_mean=None, sm_std=None):
         # rows: a DataFrame of filtered master-CSV rows (has_HLS==1).
         # merra_df: per-split MERRA frame, MultiIndexed on (network, station),
         #           with a `time` column and all MERRA_COLS (LND+SLV merged).
-        self.rows = rows.reset_index(drop=True)
-        self.chips_root = chips_root
-        self.merra_df = merra_df
-        self.means = np.asarray(means)
-        self.stds = np.asarray(stds)
-        self.merra_means = np.asarray(merra_means)
-        self.merra_stds = np.asarray(merra_stds)
-        self.sm_mean = np.asarray(sm_mean)
-        self.sm_std = np.asarray(sm_std)
-        # Random tile selection uses the global numpy RNG (seeded by set_seed).
-        assert modality in ("hls", "merra", "both"), f"bad modality {modality}"
-        self.modality = modality
-        self.use_hls = modality in ("hls", "both")
-        self.use_merra = modality in ("merra", "both")
+        self.rows = df.reset_index(drop=True)
+        self.modalities = modalities
+        
+        if sm_mean is None:
+            self.sm_mean, self.sm_std = self.sm_stats(df=df, cols=["soil_moisture"])
+        else:
+            self.sm_mean, self.sm_std = sm_mean, sm_std
+        
+    def sm_stats(self, df, cols, ddof=1):
+        """Computes the mean and std of a dataframe using ddof=1."""
+        arr = df[cols].to_numpy()
+        return arr.mean(axis=0), arr.std(axis=0, ddof=ddof)
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, idx):
-        # TODO: need to pipeline the multi-temporal codepath here
+        sample = {}
         
         row = self.rows.iloc[idx]
-        network, station = str(row["network"]), str(row["station"])
-        day = date.fromisoformat(str(row["date"]))
 
-        # Resolve the chip path in any modality: HLS reads its pixels, and MERRA
-        # is keyed off the chip's overpass time, so the path is needed even in
-        # merra-only (the has_HLS==1 filter guarantees a chip exists).
-        # TODO: use the actual soil-moisture measurement time when available;
-        #       currently unobtainable, so MERRA is keyed off the HLS overpass
-        #       time (from the chip filename) to stay comparable with `both`.
-        chip_path = resolve_chip(network, station, day, self.chips_root)
-
-        # --- HLS: read + per-band z-score (only when used) ---
-        if self.use_hls:
-            image, center_lonlat = load_raster(
-                chip_path, crop=(50, 50), return_center_lonlat=True
-            )
-            image = preprocess_image(image, self.means, self.stds)  # (C, H, W)
-            image = image.to(torch.float)
-        else:
-            # terratorch's PixelwiseRegressionTask hard-requires batch["image"];
-            # emit a tiny dummy placeholder that the merra-only model ignores.
-            image = torch.zeros(1, dtype=torch.float)
-
-        # --- SM target: z-score (always) ---
         sm = (float(row["soil_moisture"]) - self.sm_mean) / self.sm_std
         sm = torch.from_numpy(np.asarray(sm, dtype=np.float32).reshape(1))
 
-        sample = {
-            "image": image,
-            "mask": sm.to(torch.float),
-            "filename": chip_path,
-        }
-
-        # --- MERRA: vector nearest the HLS overpass time, per-variable z-score ---
-        if self.use_merra:
-            when = overpass_datetime(chip_path)
-            merra = merra_vector(self.merra_df, network, station, when)  # (n_vars,)
-            merra_norm = (merra - self.merra_means) / self.merra_stds
-            merra_norm = torch.from_numpy(merra_norm.astype(np.float32))
-            sample["pt1d"] = merra_norm.to(torch.float)
+        for modality in self.modalities:
+            sample.update(modality[idx])
+        # mask is the label
+        sample.update({"mask": sm.to(torch.float)})
+        # PixelwiseRegressionTask.predict_step requires filename
+        sample.update({"filename": ""})
 
         return sample
 
@@ -382,13 +168,12 @@ class sm_dataset(NonGeoDataset):
 # ---------------------------------------------------------------------------
 class sm_dataloader(LightningModule):
 
-    def __init__(self, dataset_train=None, dataset_test=None,
-                 train_batch_size=None, test_batch_size=None, config=None):
+    def __init__(self, dataset_train=None, dataset_test=None, config=None):
         super().__init__()
         self.dataset_train = dataset_train
         self.dataset_test = dataset_test
-        self.train_batch_size = train_batch_size
-        self.test_batch_size = test_batch_size
+        self.train_batch_size = config["training"]["train_batch_size"]
+        self.test_batch_size = config["testing"]["test_batch_size"]
         self.config = config
 
     def setup(self, stage: str = None):

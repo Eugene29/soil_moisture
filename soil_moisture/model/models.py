@@ -1,13 +1,11 @@
 from typing import List, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 from terratorch.models.pixel_wise_model import freeze_module
 from lightning import LightningModule
 from terratorch.models.model import ModelOutput
 from terratorch.models.backbones.prithvi_mae import PatchEmbed, TemporalEncoder, LocationEncoder, _init_weights, get_3d_sincos_pos_embed
-from einops import rearrange
 from timm.layers import to_2tuple
 from timm.models.vision_transformer import Block
 
